@@ -1,0 +1,5 @@
+# Patch layer contributed by @dsh-restart/one-click-restart.
+# Referenced by package name so Node resolves against the installed bundle.
+- insert:
+    - id: one-click-restart
+      name: "@dsh-restart/one-click-restart"
