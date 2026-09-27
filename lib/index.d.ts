@@ -10,9 +10,10 @@
  *      `webServer` service, so the client sidebar button (or any same-origin
  *      caller holding the shared token) can trigger the same restart.
  *   3. Spawns a **detached watchdog** (scripts/relaunch.mjs) that survives this
- *      process and waits for the application to fully terminate, then relaunches
- *      it via `open -a <AppName>` (macOS) — the guarantee "restart even after
- *      the harness has exited".
+ *      process and handles the relaunch — on desktop it gracefully quits the
+ *      whole application first (AppleScript quit event) and relaunches once it
+ *      is gone; on web the host exits itself via `ctx.appExit` and the watchdog
+ *      relaunches.
  *   4. If the launcher provided `ctx.appExit` (the bounded exit request from
  *      `@deepseek-ai/dsh-cmdline`), requests a graceful `exit(0)` so the current
  *      instance actually quits before the watchdog relaunches it.
