@@ -9,10 +9,10 @@
 **方式一（推荐，一条命令）**——直接装 GitHub 仓库，仓库已含预构建产物：
 
 ```sh
-dsh plugin --profile <你的 profile> add github:G57615/dsh-one-click-restart
+dsh plugin --profile <你的 profile> add github:G57651/dsh-one-click-restart
 ```
 
-**方式二**——下载 [Releases](https://github.com/G57615/dsh-one-click-restart/releases) 里的 `.tgz`：
+**方式二**——下载 [Releases](https://github.com/G57651/dsh-one-click-restart/releases) 里的 `.tgz`：
 
 ```sh
 dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.1.0.tgz
