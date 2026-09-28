@@ -15,7 +15,7 @@ dsh plugin --profile <你的 profile> add github:G57651/dsh-one-click-restart
 **方式二**——下载 [Releases](https://github.com/G57651/dsh-one-click-restart/releases) 里的 `.tgz`：
 
 ```sh
-dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.1.0.tgz
+dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.1.1.tgz
 ```
 
 装完**重启一次 DSH**。之后侧边栏左下角（Settings 上方）会出现「重启 Harness」。
@@ -34,10 +34,10 @@ dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.1.0.
 
 ## 兼容性
 
-- 依赖 `@deepseek-ai/dsh-tools: ^0.1.7-rc.1`，即**只支持 DSH 0.1.7-rc.x**。
-- DSH 会主动检查插件声明的 `@deepseek-ai/dsh-*` peer：版本不匹配时，**安装会被直接拒绝或回滚**，已装的插件行会被置为 `disabled`（表现为「插件没生效」而不是报错）。
+- 依赖 `@deepseek-ai/dsh-tools: ^0.1.7-rc.1 || ^0.2.0-rc.1`，支持 DSH 0.1.7-rc.x 与 0.2.0-rc.x。
+- DSH（0.2.0 起）会主动检查插件声明的 `@deepseek-ai/dsh-*` peer：版本不匹配时，**安装会被直接拒绝或回滚**，已装的插件行会被置为 `disabled`（表现为「插件没生效」而不是报错）。
 - 这是有意为之：客户端 bundle 依赖宿主的模块表与 sidebar slot 契约，这些都随 DSH 版本变化，而宿主**不对客户端产物做任何版本检查**。宁可让不兼容在安装期报错，也不让它在运行时炸。
-- DSH 发布 0.2.0 时本插件需要跟进更新。届时请用 `dsh plugin --profile <p> allow-version ...` 临时豁免，或等新版本。
+- DSH 发布更新的 0.2.x / 0.3.0 时本插件需要再次跟进 peer 范围。届时可用 `dsh plugin --profile <p> allow-version ...` 临时豁免，或等新版本。
 
 ## 功能
 
@@ -109,3 +109,9 @@ pnpm build          # tsc 产出 lib/index.js，esbuild 产出 lib/client.js
 ## 许可
 
 [MIT](./LICENSE)
+
+## 变更记录
+
+### 0.1.1
+
+- **package.json**：`@deepseek-ai/dsh-tools` peer 范围放宽为 `^0.1.7-rc.1 || ^0.2.0-rc.1`——0.2.0-rc.1 起宿主对 `@deepseek-ai/dsh-*` 命名空间的 peerDependencies 做兼容性预检，旧范围在 0.2.0-rc.1 上会被预检禁用（stderr 报 "disabling profile plugin"）。`tools` 服务名、`defineTool`、`webServer.register(WebRoute)`、`webserver/index-inject` 的 `{kind:'global'}` 行、`ctx.get('appExit')` 在 0.2.0-rc.1 均未变化，此改动仅为通过预检，宿主侧代码零改动。
