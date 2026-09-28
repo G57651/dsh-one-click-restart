@@ -2,10 +2,13 @@
  * Browser half of @dsh-restart/one-click-restart: a "Restart" button in the
  * sidebar foot, next to Settings.
  *
- * The host half serves `POST /api/restart-harness` and publishes the shared
- * token as `globalThis.__DSH_RESTART_TOKEN__` through a `webserver/index-inject`
- * `global` row (reached over HTTP on web, and over the desktop boot IPC
- * injections — both paths land the value before the client bundle runs).
+ * The host half serves `POST /api/restart-harness` and authorizes the call with
+ * a shared token. The client reads that token from the host over a same-origin
+ * `GET /api/restart-harness` (the token is no longer injected into the page:
+ * the desktop window loads its index from the app bundle's static `dist`, so
+ * the `webserver/index-inject` row never reached the page there and every
+ * click failed with 401). The legacy `globalThis.__DSH_RESTART_TOKEN__`
+ * injection is still honored as a fast path when present.
  * This half contributes a component to the sidebar shell's
  * `sidebar.footer.action` list slot, so no host/UI source changes are needed.
  */
@@ -25,7 +28,7 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
   }
 }
 
-/** Host-published shared secret for the restart route. */
+/** Legacy host-published shared secret (still honored when the page has it). */
 declare global {
   var __DSH_RESTART_TOKEN__: string | undefined
 }
@@ -40,27 +43,62 @@ const STYLE_TAG_ID = '@dsh-restart/one-click-restart/client.css'
 type Phase = 'idle' | 'pending' | 'scheduled' | 'failed'
 
 /**
+ * Read the shared token from the host. The route is same-origin, so the host
+ * can trust the request (loopback Host + `sec-fetch-site` checks on its side)
+ * without the page ever holding a token it cannot refresh.
+ */
+async function fetchToken(): Promise<string | undefined> {
+  const response = await fetch(RESTART_ROUTE, { method: 'GET' })
+  if (!response.ok) return undefined
+  const body: unknown = await response.json().catch(() => undefined)
+  if (body !== null && typeof body === 'object' && typeof (body as { token?: unknown }).token === 'string') {
+    return (body as { token: string }).token
+  }
+  return undefined
+}
+
+/**
  * POST the restart route. The watchdog is spawned server-side before the
  * reply, so a 200 means the relaunch is already scheduled; the graceful exit
  * follows microseconds later and the page dies with the host process.
  *
- * A network failure right after the POST is also the expected shape of a
- * successful restart (the host exits mid-request), so it is reported as
- * `likely` — a "scheduled" state with a hedged message — instead of an error.
+ * A network failure *after* the host accepted the call is also the expected
+ * shape of a successful restart (the host exits mid-request). That is only
+ * safe to report as "scheduled" when the request reached the host at all:
+ * a failure to even obtain a token, or a rejected call, is a real error and
+ * is surfaced as such.
  */
 async function requestRestart(): Promise<{ ok: boolean; likely?: boolean; message?: string }> {
-  const token = globalThis.__DSH_RESTART_TOKEN__
+  let token = globalThis.__DSH_RESTART_TOKEN__
+  if (typeof token !== 'string' || token === '') {
+    try {
+      token = await fetchToken()
+    } catch {
+      return {
+        ok: false,
+        message: '无法连接宿主，重启未开始 — 请确认 DSH 正在运行后重试',
+      }
+    }
+  }
+  if (token === undefined) {
+    return { ok: false, message: 'unauthorized: restart token unavailable — is the restart route enabled?' }
+  }
   let response: Response
   try {
     response = await fetch(RESTART_ROUTE, {
       method: 'POST',
-      headers: token === undefined ? {} : { 'x-restart-token': token },
+      headers: { 'x-restart-token': token },
     })
   } catch {
+    // The token was valid and the POST was sent: the host most likely exited
+    // mid-request, which is exactly what a successful restart looks like.
     return { ok: true, likely: true }
   }
   if (response.status === 401) {
-    return { ok: false, message: 'unauthorized: restart token missing or stale — reload the page' }
+    // The token we held was stale (host restarted since). Clear the fast-path
+    // copy so the next click re-fetches instead of repeating the failure.
+    globalThis.__DSH_RESTART_TOKEN__ = undefined
+    return { ok: false, message: 'unauthorized: restart token is stale — click again' }
   }
   if (!response.ok) return { ok: false, message: `HTTP ${response.status}` }
   return { ok: true }

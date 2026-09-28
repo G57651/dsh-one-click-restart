@@ -43,7 +43,9 @@ dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.1.1.
 
 1. **侧边栏按钮**：向 sidebar 底部的 `sidebar.footer.action` list slot 注入按钮。宽栏为「图标 + 文字」整行，窄栏（56px rail）为圆形图标；重启进行中图标持续旋转、文字带跳动点；失败时停止并显示原因。
 2. **`restart_harness` 工具**：模型/agent 可直接调用（可选 `delayMs` 覆盖延迟）。
-3. **令牌保护的 HTTP 路由**：`POST /api/restart-harness`，校验 `x-restart-token`。令牌由宿主在启动时注入页面，浏览器侧读取 `globalThis.__DSH_RESTART_TOKEN__`。
+3. **令牌保护的 HTTP 路由**：`GET /api/restart-harness` 返回当前令牌（同源、限 loopback），`POST /api/restart-harness` 校验 `x-restart-token` 后触发重启。
+   - 客户端**不再依赖页面注入**：桌面端窗口的 index 来自应用包内的静态 `dist`，宿主渲染时注入的 `globalThis.__DSH_RESTART_TOKEN__` 到不了那个页面，所以按钮改为先从同源 `GET` 取令牌再 `POST`。注入仍在（Web 端作为一次往返的快路径），页面已有令牌时不再请求。
+   - 这条 `exact` 路由会**优先于** Connection 包的 `/api` 前缀路由，因此宿主通用 API 信任栅栏（loopback Host 校验 + 拒绝 `sec-fetch-site: cross-site`）不会作用到它——插件在 handler 内自行做了同样的校验，非 loopback / 跨站请求直接 403。
 
 ## 工作原理
 
@@ -81,7 +83,9 @@ Node/Electron 进程无法自己拉起自己，所以重启动作交给一个**�
 |---|---|
 | **侧边栏没有按钮** | 装完没重启 DSH；或 profile 的 `cordis.patch.yml` 里该行被 `disabled: true`；或 DSH 版本不兼容（见上）。先确认 `dsh.profile.bundles` 里有 `@dsh-restart/one-click-restart`。 |
 | **提示 `failed to import`** | 装到的是没有 `lib/` 的源码。`lib/` 已随仓库提交，若仍发生，检查 `node_modules/@dsh-restart/one-click-restart/lib/index.js` 是否存在。 |
-| **按钮变红「重启失败：unauthorized」** | 页面持有的令牌与宿主当前令牌不一致（HMR 重载或宿主重启后）。刷新页面即可。 |
+| **按钮变红「重启失败：unauthorized: restart token is stale」** | 页面持有的令牌与宿主当前令牌不一致（宿主重启后）。再点一次即可——按钮会自动丢弃陈旧令牌并重新取。 |
+| **按钮变红「无法连接宿主，重启未开始」** | 取令牌的同源 `GET` 都没成功：宿主进程已不在、端口不通、或路由被禁用（`enableHttpRoute: false`）。确认 DSH 正在运行，或检查 profile 配置。 |
+| **按钮变红「重启失败：forbidden」** | 请求不是从本机 loopback 同源页面发出的（被反代/远程访问改写了 Host，或 `sec-fetch-site: cross-site`）。此路由按设计只服务本机页面。 |
 | **点了只退出、不重新拉起** | 看 `~/Library/Logs/DeepSeek Harness/crash-*.log`。若出现宿主被弹恢复对话框，说明走了非预期路径；macOS 上还需确认 `open -a "DeepSeek Harness"` 能拉起应用（应用名改了需同步 `appName`）。 |
 | **点了完全没反应** | 应用可能有活跃任务，Harness 自身的退出确认拦下了。 |
 
@@ -89,8 +93,10 @@ Node/Electron 进程无法自己拉起自己，所以重启动作交给一个**�
 
 ```sh
 pnpm install
-pnpm build          # tsc 产出 lib/index.js，esbuild 产出 lib/client.js
+pnpm build          # tsc 产出 lib/index.js 与 lib/index.d.ts，esbuild 产出 lib/client.js
 ```
+
+> ⚠️ 当前仓库只提交了 `src/client/index.tsx`（客户端半部的权威源码），宿主半部的 `src/index.ts` 与 `tsconfig*.json` 尚未纳入本仓库，因此 `pnpm build` 的 tsc 步骤跑不起来。宿主的权威产物是 `lib/index.js` + `lib/index.d.ts`。改宿主半部时请直接改 `lib/index.js` 并同步 `lib/index.d.ts`。
 
 `lib/client.js` 是发往浏览器的 closure-factory 产物（`window.__ModuleLoader__.load({ id, factory })`），只外部化 `react` / `react/jsx-runtime` 两个宿主种子模块。**改动 `src/` 后请一并提交 `lib/`**，否则 `github:` 安装拿到的仍是旧代码。
 
@@ -99,8 +105,7 @@ pnpm build          # tsc 产出 lib/index.js，esbuild 产出 lib/client.js
 ```
 ├── package.json          # dsh.bundle（host patch）+ dsh.client（web 声明）+ exports["./client"]
 ├── cordis.patch.yml      # 贡献给 profile 的 patch layer
-├── src/index.ts          # 宿主半部：工具、路由、令牌、退出策略
-├── src/client/index.tsx  # 客户端半部：侧边栏按钮
+├── src/client/index.tsx  # 客户端半部：侧边栏按钮（宿主半部源码未纳入本仓库，见上）
 ├── scripts/relaunch.mjs  # 独立 watchdog
 ├── scripts/build-client.mjs
 └── lib/                  # 预构建产物（随仓库提交）
@@ -111,6 +116,19 @@ pnpm build          # tsc 产出 lib/index.js，esbuild 产出 lib/client.js
 [MIT](./LICENSE)
 
 ## 变更记录
+
+### 0.2.0-rc.1（未发版，工作树）
+
+针对 DSH 0.2.0-rc.1 的一轮修复（详见 `audit/restart-fixes.md`）：
+
+- **修掉「按钮 401 unauthorized」根因**：桌面窗口的 index 由应用包内静态 `dist` 提供，宿主 `webserver/index-inject` 的注入行到不了那个页面，`globalThis.__DSH_RESTART_TOKEN__` 恒为 `undefined`。改为客户端先同源 `GET /api/restart-harness` 取令牌再 `POST`；注入保留为 Web 端快路径。`lib/index.js` 的 handler 增加 GET 分支（`{ token }`，`cache-control: no-store`），`Allow` 改为 `GET, POST`。
+- **补上被 exact 路由绕过的信任栅栏**：该路由优先于 Connection 包的 `/api` 前缀路由，所以通用栅栏失效；handler 内新增 loopback Host 校验与 `sec-fetch-site: cross-site` 拒绝（不通过 → 403）。
+- **客户端不再把网络错误当成功**：取令牌失败时返回失败并给出可操作文案（原来一律 `{ ok: true }`）；只有「已持有令牌、POST 确已发出」后的连接中断才按成功处理。
+- **配置字段全部 `.volatile()`**：7 个字段改为 schemastery volatile 引用，读取统一走新的 `configValue` / `readConfig` 快照，HMR 重载后令牌与设置不会钉死在旧值上。
+- **服务名命名空间化**：`ctx.provide('restartHarnessToken')` → `'oneClickRestart.token'`（`lib/index.d.ts` 的 module augmentation 同步）。
+- **`dsh.client.inject` 补 `@deepseek-ai/dsh-client-ui-renderer`**（`slots` 服务的真实提供者；sidebar 保留）。
+- **devDependencies 对齐 0.2.0-rc.1**（原来是 0.1.7-rc.x）。
+- **watchdog 加固**：`--app-name` 增加白名单校验（非法值回退默认名并告警）；`killRemaining` 改为先 pgrep 枚举 PID、`ps` 复核归属后再按 PID 发信号，并打印被杀 PID，不再用 `pkill -f` 直接匹配全命令行。
 
 ### 0.1.1
 

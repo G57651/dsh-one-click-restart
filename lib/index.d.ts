@@ -21,29 +21,49 @@
  * No host/main.js modification is required: the relaunch is performed by the
  * OS launcher (`open`), orthogonal to the Electron lifecycle.
  */
-import type { Context } from '@deepseek-ai/cordis';
+import type { Context, Volatile } from '@deepseek-ai/cordis';
 import Schema from '@deepseek-ai/schemastery';
 export declare const name = "one-click-restart";
 export declare const inject: string[];
-/** Configuration for the one-click restart plugin. */
+/**
+ * Configuration for the one-click restart plugin, as the loader declares it.
+ *
+ * Every field is schemastery-`volatile()`, so a parsed config holds stable
+ * `{ get() }` references rather than plain values; read them through
+ * {@link resolveConfig} or a per-field `.get()`.
+ */
 export interface Config {
     /** Name used to identify the app for `open -a`. */
-    appName: string;
+    appName: Volatile<string>;
     /** Optional absolute path to the .app bundle (fallback when `-a` matches nothing). */
-    appBundlePath?: string;
+    appBundlePath: Volatile<string | undefined>;
     /** Milliseconds to wait after exit before relaunching. */
-    relaunchDelayMs: number;
+    relaunchDelayMs: Volatile<number>;
     /** Maximum relaunch attempts before the watchdog gives up. */
-    maxRelaunchAttempts: number;
+    maxRelaunchAttempts: Volatile<number>;
     /** Shared token the client button must present to the HTTP restart route. */
-    restartToken: string;
+    restartToken: Volatile<string>;
     /** Whether to expose the HTTP restart route for the client button. */
-    enableHttpRoute: boolean;
+    enableHttpRoute: Volatile<boolean>;
     /** Whether to request a graceful host exit (`ctx.appExit(0)`) before relaunch. */
+    requestGracefulExit: Volatile<boolean>;
+}
+/** Config field values with the volatile references resolved. */
+export interface ResolvedConfig {
+    appName: string;
+    appBundlePath: string | undefined;
+    relaunchDelayMs: number;
+    maxRelaunchAttempts: number;
+    restartToken: string;
+    enableHttpRoute: boolean;
     requestGracefulExit: boolean;
 }
 /** Schemastery schema; defaults live here so `cordis.yml` can tune without code edits. */
 export declare const Config: Schema<Config>;
+/** Resolve one config field, tolerating a volatile reference or a plain value. */
+export declare function configValue<T>(field: Volatile<T> | T): T;
+/** Snapshot every config field into plain values, once per operation. */
+export declare function resolveConfig(config: Config): ResolvedConfig;
 /** A restart outcome, shared by the tool and HTTP route bodies. */
 export interface RestartOutcome {
     watchdogSpawned: boolean;
@@ -86,16 +106,16 @@ export declare function requestGracefulExit(ctx: Context): boolean;
  * and the browser reports "Failed to fetch" even though the restart is
  * underway.
  */
-export declare function performRestart(ctx: Context, config: Config, overrides?: {
+export declare function performRestart(ctx: Context, config: ResolvedConfig, overrides?: {
     delayMs?: number;
     deferExit?: boolean;
 }): RestartOutcome;
 export declare function apply(ctx: Context, config: Config): void;
 /** Read-only token handle other host plugins may inject.
- *  Declared here so `inject: ['restartHarnessToken']` type-checks. */
+ *  Declared here so `inject: ['oneClickRestart.token']` type-checks. */
 declare module '@deepseek-ai/cordis' {
     interface Context {
-        restartHarnessToken?: {
+        'oneClickRestart.token'?: {
             get(): string;
         };
     }
