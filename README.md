@@ -96,7 +96,7 @@ pnpm install
 pnpm build          # tsc 产出 lib/index.js 与 lib/index.d.ts，esbuild 产出 lib/client.js
 ```
 
-> ⚠️ 当前仓库只提交了 `src/client/index.tsx`（客户端半部的权威源码），宿主半部的 `src/index.ts` 与 `tsconfig*.json` 尚未纳入本仓库，因此 `pnpm build` 的 tsc 步骤跑不起来。宿主的权威产物是 `lib/index.js` + `lib/index.d.ts`。改宿主半部时请直接改 `lib/index.js` 并同步 `lib/index.d.ts`。
+> 自 v0.1.4 起 `src/index.ts`（宿主半部）与 `lib/` 产物重新同步：`pnpm build` 先跑 `tsc -p tsconfig.build.json` 产出 `lib/index.js` + `lib/index.d.ts`，再跑 `scripts/build-client.mjs` 产出 `lib/client.js`。改宿主半部请改 `src/index.ts` 后重新构建并提交 `lib/`。
 
 `lib/client.js` 是发往浏览器的 closure-factory 产物（`window.__ModuleLoader__.load({ id, factory })`），只外部化 `react` / `react/jsx-runtime` 两个宿主种子模块。**改动 `src/` 后请一并提交 `lib/`**，否则 `github:` 安装拿到的仍是旧代码。
 
@@ -105,7 +105,8 @@ pnpm build          # tsc 产出 lib/index.js 与 lib/index.d.ts，esbuild 产�
 ```
 ├── package.json          # dsh.bundle（host patch）+ dsh.client（web 声明）+ exports["./client"]
 ├── cordis.patch.yml      # 贡献给 profile 的 patch layer
-├── src/client/index.tsx  # 客户端半部：侧边栏按钮（宿主半部源码未纳入本仓库，见上）
+├── src/index.ts          # 宿主半部源码（与 lib/ 产物同步）
+├── src/client/index.tsx  # 客户端半部：侧边栏按钮
 ├── scripts/relaunch.mjs  # 独立 watchdog
 ├── scripts/build-client.mjs
 └── lib/                  # 预构建产物（随仓库提交）
@@ -116,6 +117,17 @@ pnpm build          # tsc 产出 lib/index.js 与 lib/index.d.ts，esbuild 产�
 [MIT](./LICENSE)
 
 ## 变更记录
+
+### 0.1.4
+
+- **修复客户端 bundle 无法加载**（隔离 DSH 0.2.0-rc.2 真机测试发现）：`lib/client.js` 包装行的 `{ value: Module }` 缺少引号——`Module` 在 factory 作用域未定义，浏览器加载客户端入口即抛 `ReferenceError: Module is not defined`，**侧边栏按钮因此从未出现**（宿主报 "web boot: 1 entry did not activate"）。本版把 `src/index.ts` 同步到 lib 的最新实现并重新执行 `pnpm build`，由 `scripts/build-client.mjs` 的正确包装模板产出客户端产物，从构建链上根治。
+- **`src/index.ts` 与 `lib/` 重新同步**：此前 src 停留在 0.1.1 语义（无 volatile 配置、无 GET 令牌分支、无回环信任栅栏、仍是旧服务名 `restartHarnessToken`），而 lib 是权威产物。现在 src 是完整的 TS 源（`Volatile` 配置接口、`configValue`/`readConfig` 快照、GET+POST 路由、`isTrustedLoopbackRequest`、裸 IPv6 `::1` Host 修正、`oneClickRestart.token` 命名空间化 provide），`pnpm build`（tsc + esbuild）产出全部 lib/ 产物，类型检查通过，行为经 10 项回归断言验证与 0.1.3 逐项一致。
+
+### 0.1.3（重构版，对外行为与接口不变）
+
+- **`lib/index.d.ts` 与实现对齐**：删除了实现里既未导出也不存在的 `configValue` / `resolveConfig` 导出声明（二者在 `lib/index.js` 中是模块内私有函数）；补上已导出的 `isTrustedLoopbackRequest` 类型声明。此前从类型入口 import 这两个名字会得到运行时 `undefined`。
+- **`apply()` 拆分**：工具定义与 HTTP route handler 分别提取为 `createRestartTool` / `createRestartRouteHandler` 工厂（模块内私有），`apply` 只负责装配。GET 返回 apply 期令牌、POST 按快照令牌校验、web 路径经 `finish`/`close` 延迟退出等行为逐行保留。
+- 工具名、路由、配置字段、令牌缓存与信任栅栏逻辑零变化；watchdog（`scripts/relaunch.mjs`）与客户端产物（`lib/client.js`）未改动。
 
 ### 0.2.0-rc.1（未发版，工作树）
 

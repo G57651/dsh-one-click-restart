@@ -6,9 +6,10 @@
  *
  *   1. Registers a `restart_harness` tool so the model (or any plugin injecting
  *      `tools`) can trigger a restart.
- *   2. Registers a loopback HTTP route `POST /api/restart-harness` on the host
- *      `webServer` service, so the client sidebar button (or any same-origin
- *      caller holding the shared token) can trigger the same restart.
+ *   2. Registers a loopback HTTP route on the host `webServer` service
+ *      (`GET` hands out the shared token, `POST` performs the restart), so the
+ *      client sidebar button — or any same-origin caller holding the token —
+ *      can trigger the same restart.
  *   3. Spawns a **detached watchdog** (scripts/relaunch.mjs) that survives this
  *      process and handles the relaunch — on desktop it gracefully quits the
  *      whole application first (AppleScript quit event) and relaunches once it
@@ -25,12 +26,23 @@ import type { Context, Volatile } from '@deepseek-ai/cordis';
 import Schema from '@deepseek-ai/schemastery';
 export declare const name = "one-click-restart";
 export declare const inject: string[];
-/**
- * Configuration for the one-click restart plugin, as the loader declares it.
+/** Raw `Config` values as the loader accepts them, before schemastery wraps
+ * every field into its volatile `{ get() }` reference (the input side of the
+ * schema; the parsed output type is {@link Config}). */
+export interface ConfigInput {
+    appName?: string | null;
+    appBundlePath?: string | null;
+    relaunchDelayMs?: number | null;
+    maxRelaunchAttempts?: number | null;
+    restartToken?: string | null;
+    enableHttpRoute?: boolean | null;
+    requestGracefulExit?: boolean | null;
+}
+/** Configuration for the one-click restart plugin, as the loader declares it.
  *
  * Every field is schemastery-`volatile()`, so a parsed config holds stable
  * `{ get() }` references rather than plain values; read them through
- * {@link resolveConfig} or a per-field `.get()`.
+ * {@link configValue} / {@link readConfig}.
  */
 export interface Config {
     /** Name used to identify the app for `open -a`. */
@@ -58,18 +70,20 @@ export interface ResolvedConfig {
     enableHttpRoute: boolean;
     requestGracefulExit: boolean;
 }
-/** Schemastery schema; defaults live here so `cordis.yml` can tune without code edits. */
-export declare const Config: Schema<Config>;
-/** Resolve one config field, tolerating a volatile reference or a plain value. */
-export declare function configValue<T>(field: Volatile<T> | T): T;
-/** Snapshot every config field into plain values, once per operation. */
-export declare function resolveConfig(config: Config): ResolvedConfig;
 /** A restart outcome, shared by the tool and HTTP route bodies. */
 export interface RestartOutcome {
     watchdogSpawned: boolean;
     gracefulExitRequested: boolean;
     detail: string;
 }
+/** Schemastery schema; defaults live here so `cordis.yml` can tune without code edits.
+ *
+ * Every field is `.volatile()`: restart settings (app identity, delay, the
+ * shared token, the two switches) are read per operation and may change at
+ * runtime, so schemastery hands us a stable `{ get() }` reference instead of a
+ * frozen value. {@link readConfig} resolves them once per operation.
+ */
+export declare const Config: Schema<ConfigInput, Config>;
 /**
  * True when this host process is a supervised child of the Electron app.
  * On desktop the restart must quit the whole application (main.js treats an
@@ -77,6 +91,18 @@ export interface RestartOutcome {
  * parent IPC), so the watchdog owns the quit-and-relaunch.
  */
 export declare function isDesktopHost(): boolean;
+/**
+ * Loopback guard for the restart route. The route is registered as an `exact`
+ * WebServer route, and exact routes win over the Connection package's `/api`
+ * prefix route — so the request never passes through that package's
+ * `isTrustedApiRequest` fence (loopback Host + `sec-fetch-site` rejection).
+ * Both checks are re-implemented here, and the canonical loopback literals are
+ * accepted; mirrors packages/client/connection/src/api-request-trust.ts and
+ * packages/client/connection/src/loopback-hostname.ts.
+ */
+export declare function isTrustedLoopbackRequest(req: {
+    headers: Record<string, string | string[] | undefined>;
+}): boolean;
 /**
  * Request the launcher's bounded graceful exit (`ctx.appExit(0)`), probed
  * live at call time. Returns whether a bounded exit was actually requested.
@@ -105,6 +131,9 @@ export declare function requestGracefulExit(ctx: Context): boolean;
  * response's `finish` event; exiting on a microtask races the socket write
  * and the browser reports "Failed to fetch" even though the restart is
  * underway.
+ *
+ * `config` is a plain value snapshot (see {@link readConfig}), not the raw
+ * schema output whose volatile fields are `{ get() }` references.
  */
 export declare function performRestart(ctx: Context, config: ResolvedConfig, overrides?: {
     delayMs?: number;

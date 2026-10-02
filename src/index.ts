@@ -6,9 +6,10 @@
  *
  *   1. Registers a `restart_harness` tool so the model (or any plugin injecting
  *      `tools`) can trigger a restart.
- *   2. Registers a loopback HTTP route `POST /api/restart-harness` on the host
- *      `webServer` service, so the client sidebar button (or any same-origin
- *      caller holding the shared token) can trigger the same restart.
+ *   2. Registers a loopback HTTP route on the host `webServer` service
+ *      (`GET` hands out the shared token, `POST` performs the restart), so the
+ *      client sidebar button — or any same-origin caller holding the token —
+ *      can trigger the same restart.
  *   3. Spawns a **detached watchdog** (scripts/relaunch.mjs) that survives this
  *      process and handles the relaunch — on desktop it gracefully quits the
  *      whole application first (AppleScript quit event) and relaunches once it
@@ -21,11 +22,11 @@
  * No host/main.js modification is required: the relaunch is performed by the
  * OS launcher (`open`), orthogonal to the Electron lifecycle.
  */
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context, Volatile } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-cmdline'
-import type { WebServer } from '@deepseek-ai/dsh-host-webserver'
+import type { WebRoute, WebServer } from '@deepseek-ai/dsh-host-webserver'
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
@@ -36,49 +37,59 @@ export const name = 'one-click-restart'
 // because the HTTP route is optional. `appExit` is also probed at runtime.
 export const inject = ['tools']
 
-/** Configuration for the one-click restart plugin. */
-export interface Config {
-  /** Name used to identify the app for `open -a`. */
-  appName: string
-  /** Optional absolute path to the .app bundle (fallback when `-a` matches nothing). */
-  appBundlePath?: string
-  /** Milliseconds to wait after exit before relaunching. */
-  relaunchDelayMs: number
-  /** Maximum relaunch attempts before the watchdog gives up. */
-  maxRelaunchAttempts: number
-  /** Shared token the client button must present to the HTTP restart route. */
-  restartToken: string
-  /** Whether to expose the HTTP restart route for the client button. */
-  enableHttpRoute: boolean
-  /** Whether to request a graceful host exit (`ctx.appExit(0)`) before relaunch. */
-  requestGracefulExit: boolean
+// Hostname forms the loopback guard accepts (mirrors the connection package's
+// isLoopbackHostname: 'localhost', the IPv6 loopback, and 127.0.0.0/8).
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
+
+/** Route path served by the optional HTTP entry. */
+const RESTART_ROUTE = '/api/restart-harness'
+
+/** Raw `Config` values as the loader accepts them, before schemastery wraps
+ * every field into its volatile `{ get() }` reference (the input side of the
+ * schema; the parsed output type is {@link Config}). */
+export interface ConfigInput {
+  appName?: string | null
+  appBundlePath?: string | null
+  relaunchDelayMs?: number | null
+  maxRelaunchAttempts?: number | null
+  restartToken?: string | null
+  enableHttpRoute?: boolean | null
+  requestGracefulExit?: boolean | null
 }
 
-/** Schemastery schema; defaults live here so `cordis.yml` can tune without code edits. */
-export const Config: Schema<Config> = Schema.object({
-  appName: Schema.string()
-    .default('DeepSeek Harness')
-    .description('App name for `open -a <name>` on macOS.'),
-  appBundlePath: Schema.string()
-    .description('Optional absolute path to the .app bundle.'),
-  relaunchDelayMs: Schema.number()
-    .default(1500)
-    .description('Delay in ms between process exit and relaunch.'),
-  maxRelaunchAttempts: Schema.number()
-    .default(10)
-    .description('How many times the watchdog retries relaunching.'),
-  restartToken: Schema.string()
-    .default('')
-    .description('Shared secret the HTTP route requires; leave empty to auto-generate one per launch.'),
-  enableHttpRoute: Schema.boolean()
-    .default(true)
-    .description('Expose POST /api/restart-harness for the client button.'),
-  requestGracefulExit: Schema.boolean()
-    .default(true)
-    .description('Request a bounded graceful exit (ctx.appExit) before relaunch.'),
-})
+/** Configuration for the one-click restart plugin, as the loader declares it.
+ *
+ * Every field is schemastery-`volatile()`, so a parsed config holds stable
+ * `{ get() }` references rather than plain values; read them through
+ * {@link configValue} / {@link readConfig}.
+ */
+export interface Config {
+  /** Name used to identify the app for `open -a`. */
+  appName: Volatile<string>
+  /** Optional absolute path to the .app bundle (fallback when `-a` matches nothing). */
+  appBundlePath: Volatile<string | undefined>
+  /** Milliseconds to wait after exit before relaunching. */
+  relaunchDelayMs: Volatile<number>
+  /** Maximum relaunch attempts before the watchdog gives up. */
+  maxRelaunchAttempts: Volatile<number>
+  /** Shared token the client button must present to the HTTP restart route. */
+  restartToken: Volatile<string>
+  /** Whether to expose the HTTP restart route for the client button. */
+  enableHttpRoute: Volatile<boolean>
+  /** Whether to request a graceful host exit (`ctx.appExit(0)`) before relaunch. */
+  requestGracefulExit: Volatile<boolean>
+}
 
-const here = dirname(fileURLToPath(import.meta.url))
+/** Config field values with the volatile references resolved. */
+export interface ResolvedConfig {
+  appName: string
+  appBundlePath: string | undefined
+  relaunchDelayMs: number
+  maxRelaunchAttempts: number
+  restartToken: string
+  enableHttpRoute: boolean
+  requestGracefulExit: boolean
+}
 
 /** A restart outcome, shared by the tool and HTTP route bodies. */
 export interface RestartOutcome {
@@ -86,6 +97,45 @@ export interface RestartOutcome {
   gracefulExitRequested: boolean
   detail: string
 }
+
+/** Schemastery schema; defaults live here so `cordis.yml` can tune without code edits.
+ *
+ * Every field is `.volatile()`: restart settings (app identity, delay, the
+ * shared token, the two switches) are read per operation and may change at
+ * runtime, so schemastery hands us a stable `{ get() }` reference instead of a
+ * frozen value. {@link readConfig} resolves them once per operation.
+ */
+export const Config: Schema<ConfigInput, Config> = Schema.object({
+  appName: Schema.string()
+    .default('DeepSeek Harness')
+    .description('App name for `open -a <name>` on macOS.')
+    .volatile(),
+  appBundlePath: Schema.string()
+    .description('Optional absolute path to the .app bundle.')
+    .volatile(),
+  relaunchDelayMs: Schema.number()
+    .default(1500)
+    .description('Delay in ms between process exit and relaunch.')
+    .volatile(),
+  maxRelaunchAttempts: Schema.number()
+    .default(10)
+    .description('How many times the watchdog retries relaunching.')
+    .volatile(),
+  restartToken: Schema.string()
+    .default('')
+    .description('Shared secret the HTTP route requires; leave empty to auto-generate one per launch.')
+    .volatile(),
+  enableHttpRoute: Schema.boolean()
+    .default(true)
+    .description('Expose the restart route for the client button.')
+    .volatile(),
+  requestGracefulExit: Schema.boolean()
+    .default(true)
+    .description('Request a bounded graceful exit (ctx.appExit) before relaunch.')
+    .volatile(),
+})
+
+const here = dirname(fileURLToPath(import.meta.url))
 
 /** Absolute path to the standalone relaunch watchdog entry (survives process exit). */
 const WATCHDOG_SCRIPT = join(here, '..', 'scripts', 'relaunch.mjs')
@@ -100,6 +150,39 @@ const HARD_EXIT_FALLBACK_MS = 6000
 const REPLY_DRAIN_DELAY_MS = 400
 
 /**
+ * Read one config field, tolerating both shapes: schemastery wraps every
+ * `.volatile()` field in a stable `{ get() }` reference, so the live value is
+ * read through the reference; a plain value is returned verbatim, so this also
+ * works for a Config built without volatile fields.
+ */
+function configValue<T>(field: Volatile<T> | T): T {
+  if (field !== null && typeof field === 'object' && typeof (field as { get?: unknown }).get === 'function') {
+    // cosmokit types get() as returning a VolatileSnapshot<T>; for the plain
+    // values this plugin reads (string | number | boolean) the snapshot is T.
+    return (field as unknown as { get: () => T }).get()
+  }
+  return field as T
+}
+
+/**
+ * Snapshot every config field into plain values, once per operation. A volatile
+ * field is meant to be captured for one operation rather than re-read
+ * mid-flight, and a mid-restart loader commit then cannot make the watchdog
+ * argv, the exit policy, and the log line disagree.
+ */
+function readConfig(config: Config): ResolvedConfig {
+  return {
+    appName: configValue(config.appName),
+    appBundlePath: configValue(config.appBundlePath),
+    relaunchDelayMs: configValue(config.relaunchDelayMs),
+    maxRelaunchAttempts: configValue(config.maxRelaunchAttempts),
+    restartToken: configValue(config.restartToken),
+    enableHttpRoute: configValue(config.enableHttpRoute),
+    requestGracefulExit: configValue(config.requestGracefulExit),
+  }
+}
+
+/**
  * True when this host process is a supervised child of the Electron app.
  * On desktop the restart must quit the whole application (main.js treats an
  * unrequested host death as fatal, and a disposed host process lingers on its
@@ -107,6 +190,32 @@ const REPLY_DRAIN_DELAY_MS = 400
  */
 export function isDesktopHost(): boolean {
   return process.connected === true
+}
+
+/**
+ * Loopback guard for the restart route. The route is registered as an `exact`
+ * WebServer route, and exact routes win over the Connection package's `/api`
+ * prefix route — so the request never passes through that package's
+ * `isTrustedApiRequest` fence (loopback Host + `sec-fetch-site` rejection).
+ * Both checks are re-implemented here, and the canonical loopback literals are
+ * accepted; mirrors packages/client/connection/src/api-request-trust.ts and
+ * packages/client/connection/src/loopback-hostname.ts.
+ */
+export function isTrustedLoopbackRequest(req: { headers: Record<string, string | string[] | undefined> }): boolean {
+  // A browser marks a genuine cross-site request; reject it outright.
+  if (req.headers['sec-fetch-site'] === 'cross-site') return false
+  const hostHeader = req.headers.host
+  const host = Array.isArray(hostHeader) ? hostHeader[0] : hostHeader
+  if (typeof host !== 'string' || host === '') return false
+  // Strip the optional `:port` suffix; `[::1]:8080` keeps its brackets, and
+  // a bare IPv6 literal keeps every colon instead of being split at the
+  // first one (the set above lists '::1' as an accepted form).
+  const authority = host.startsWith('[')
+    ? host.slice(0, host.indexOf(']') + 1)
+    : host.includes('::')
+      ? host
+      : host.split(':')[0]
+  return LOOPBACK_HOSTNAMES.has(authority.toLowerCase())
 }
 
 /**
@@ -122,7 +231,7 @@ export function isDesktopHost(): boolean {
  * The watchdog carries the app identity + policy through argv, not env, so no
  * secret/state leaks and it survives independently.
  */
-function spawnWatchdog(config: Config, options?: { quitApp?: boolean }): void {
+function spawnWatchdog(config: ResolvedConfig, options?: { quitApp?: boolean }): void {
   const argv = [
     WATCHDOG_SCRIPT,
     '--app-name', config.appName,
@@ -177,15 +286,18 @@ export function requestGracefulExit(ctx: Context): boolean {
  * response's `finish` event; exiting on a microtask races the socket write
  * and the browser reports "Failed to fetch" even though the restart is
  * underway.
+ *
+ * `config` is a plain value snapshot (see {@link readConfig}), not the raw
+ * schema output whose volatile fields are `{ get() }` references.
  */
 export function performRestart(
   ctx: Context,
-  config: Config,
+  config: ResolvedConfig,
   overrides?: { delayMs?: number; deferExit?: boolean },
 ): RestartOutcome {
   const delayMs =
     overrides?.delayMs !== undefined ? overrides.delayMs : config.relaunchDelayMs
-  const policy: Config = { ...config, relaunchDelayMs: Math.max(0, delayMs) }
+  const policy: ResolvedConfig = { ...config, relaunchDelayMs: Math.max(0, delayMs) }
   const desktop = isDesktopHost()
 
   // 1. Spawn the detached watchdog first — it must survive our own exit.
@@ -208,67 +320,171 @@ export function performRestart(
   return { watchdogSpawned: true, gracefulExitRequested: shouldGraceful, detail }
 }
 
-export function apply(ctx: Context, config: Config): void {
-  // Schemastery stores a function default verbatim (its clone() passes
-  // functions through), so the token is resolved here: a config value wins,
-  // an empty default generates a fresh per-launch secret. The generated value
-  // is cached per process so an HMR reload keeps serving the token the
-  // already-loaded page holds.
-  const restartToken = config.restartToken || (processRestartToken ??= randomBytes(16).toString('hex'))
-
-  // ---- Model-callable tool entry (the primary "one-click" entry). ----
-  ctx.tools.register(
-    defineTool({
-      name: 'restart_harness',
-      description:
-        'Restart the DeepSeek Harness application. Spawns a detached watchdog that ' +
-        'relaunches the app after the current instance exits, then requests a graceful ' +
-        'exit of the current process. On macOS this relaunches via `open -a`; the watchdog ' +
-        'retries until the app is back up or a configured attempt limit is reached.',
-      parameters: {
-        delayMs: {
-          type: 'number',
-          description:
-            'Optional override (ms) to wait after exit before relaunching. Defaults to the configured delay.',
-        },
+/**
+ * The `restart_harness` tool body — the primary "one-click" entry. Extracted
+ * from `apply` so the three concerns (tool / HTTP route / token wiring) read
+ * separately; behavior is unchanged.
+ */
+function createRestartTool({ ctx, snapshot }: {
+  ctx: Context
+  snapshot: () => ResolvedConfig
+}) {
+  return defineTool({
+    name: 'restart_harness',
+    description:
+      'Restart the DeepSeek Harness application. Spawns a detached watchdog that ' +
+      'relaunches the app after the current instance exits, then requests a graceful ' +
+      'exit of the current process. On macOS this relaunches via `open -a`; the watchdog ' +
+      'retries until the app is back up or a configured attempt limit is reached.',
+    parameters: {
+      delayMs: {
+        type: 'number',
+        description:
+          'Optional override (ms) to wait after exit before relaunching. Defaults to the configured delay.',
       },
-      output: {
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            watchdogSpawned: {
-              type: 'boolean',
-              required: true,
-              description: 'Whether the detached relaunch watchdog was spawned.',
-            },
-            gracefulExitRequested: {
-              type: 'boolean',
-              required: true,
-              description: 'Whether a bounded graceful exit was requested from the launcher.',
-            },
-            detail: {
-              type: 'string',
-              required: true,
-              description: 'Human-readable summary of what will happen next.',
-            },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          watchdogSpawned: {
+            type: 'boolean',
+            required: true,
+            description: 'Whether the detached relaunch watchdog was spawned.',
+          },
+          gracefulExitRequested: {
+            type: 'boolean',
+            required: true,
+            description: 'Whether a bounded graceful exit was requested from the launcher.',
+          },
+          detail: {
+            type: 'string',
+            required: true,
+            description: 'Human-readable summary of what will happen next.',
           },
         },
-        render: (_args, value) => [{ type: 'text', text: value.detail }],
       },
-      async execute(args, exec) {
-        exec.signal.throwIfAborted()
-        const result = performRestart(ctx, config, {
-          delayMs: typeof args.delayMs === 'number' ? args.delayMs : undefined,
-        })
-        return {
-          watchdogSpawned: result.watchdogSpawned,
-          gracefulExitRequested: result.gracefulExitRequested,
-          detail: result.detail,
-        }
-      },
-    }),
-  )
+      render: (_args, value) => [{ type: 'text', text: value.detail }],
+    },
+    async execute(args, exec) {
+      exec.signal.throwIfAborted()
+      const result = performRestart(ctx, snapshot(), {
+        delayMs: typeof args.delayMs === 'number' ? args.delayMs : undefined,
+      })
+      return {
+        watchdogSpawned: result.watchdogSpawned,
+        gracefulExitRequested: result.gracefulExitRequested,
+        detail: result.detail,
+      }
+    },
+  })
+}
+
+/**
+ * The HTTP handler behind the optional loopback route. Extracted from `apply`
+ * (same behavior, one concern per function):
+ *
+ *   GET  — hands the apply-time token to a same-origin loopback page.
+ *   POST — validates `x-restart-token` against the live snapshot, then restarts
+ *          with `deferExit`; on web the exit is requested from the response's
+ *          `finish` event so the reply flushes first.
+ *
+ * This exact route shadows the Connection package's `/api` prefix route, so the
+ * host's API trust fence never runs on it — the loopback/cross-site fence is
+ * re-checked here (see {@link isTrustedLoopbackRequest}).
+ */
+function createRestartRouteHandler({ ctx, restartToken, snapshot }: {
+  ctx: Context
+  restartToken: string
+  snapshot: () => ResolvedConfig
+}): WebRoute['handler'] {
+  return (req, res) => {
+    if (!isTrustedLoopbackRequest(req)) {
+      res.statusCode = 403
+      res.end('forbidden')
+      return
+    }
+    if (req.method === 'GET') {
+      // Fast path only: hand the token to a page the host renders itself.
+      // `webserver/index-inject` is emitted on every index render and the
+      // `global` row lands a value on `globalThis` for the browser bundle.
+      // The desktop window loads its index from the app bundle's static
+      // dist, where the row never appears — that is why the client also
+      // fetches the token over GET on the same route.
+      res.statusCode = 200
+      res.setHeader('content-type', 'application/json')
+      res.setHeader('cache-control', 'no-store')
+      res.end(JSON.stringify({ token: restartToken }), 'utf8')
+      return
+    }
+    if (req.method !== 'POST') {
+      res.statusCode = 405
+      res.setHeader('Allow', 'GET, POST')
+      res.end('method not allowed')
+      return
+    }
+    // Compare against the live token: a configured token may have
+    // been committed since apply.
+    if (req.headers['x-restart-token'] !== snapshot().restartToken) {
+      res.statusCode = 401
+      res.end('unauthorized')
+      return
+    }
+    const result = performRestart(ctx, snapshot(), { deferExit: true })
+    res.statusCode = 200
+    res.setHeader('content-type', 'application/json')
+    if (!isDesktopHost()) {
+      // Web: flush the reply and give the client a moment to read it
+      // before tearing anything down — exiting immediately after
+      // `finish` can reset the socket mid-read (the client then sees a
+      // network error instead of the 200). The exit must also hook the
+      // response's `finish`/`close` events, NOT an `res.end` callback:
+      // the composition wraps responses in the npm `compression`
+      // middleware, whose `end(chunk, encoding)` override silently
+      // drops a callback argument. (Desktop skips this: the watchdog
+      // quits the whole app after a delay, and this process dies with
+      // it.)
+      let exitRequested = false
+      const requestExitOnce = () => {
+        if (exitRequested) return
+        exitRequested = true
+        setTimeout(() => requestGracefulExit(ctx), REPLY_DRAIN_DELAY_MS)
+      }
+      res.once('finish', requestExitOnce)
+      res.once('close', requestExitOnce)
+    }
+    res.end(
+      JSON.stringify({
+        ok: true,
+        watchdogSpawned: result.watchdogSpawned,
+        gracefulExitRequested: result.gracefulExitRequested,
+      }),
+      'utf8',
+    )
+  }
+}
+
+export function apply(ctx: Context, config: Config): void {
+  // Every config field is volatile (a stable `{ get() }` reference). Three
+  // consequences shape this function:
+  //   - plain values are resolved once per operation, so the tool body and the
+  //     HTTP handler never touch a reference mid-flight;
+  //   - the generated token is cached per process, so an HMR reload keeps
+  //     serving the token an already-loaded page fetched;
+  //   - `enableHttpRoute` is captured at apply time — toggling it takes a
+  //     plugin reload, which is also what re-registers the route.
+  const initial = readConfig(config)
+  const restartToken = initial.restartToken || (processRestartToken ??= randomBytes(16).toString('hex'))
+
+  /** Snapshot the live config again, for one tool call or HTTP request. */
+  const snapshot = (): ResolvedConfig => {
+    const values = readConfig(config)
+    return { ...values, restartToken: values.restartToken || restartToken }
+  }
+
+  // ---- Model-callable tool entry (the primary "one-click" entry). ----
+  ctx.tools.register(createRestartTool({ ctx, snapshot }))
 
   // ---- Optional loopback HTTP route for the client sidebar button. ----
   // The webserver entry mounts later than this bundle (its apply awaits the
@@ -277,15 +493,11 @@ export function apply(ctx: Context, config: Config): void {
   // runs the callback whenever the service arrives (and unloads it again if
   // the service goes away); a deployment with no webServer (headless) simply
   // leaves the wait pending, which keeps no process alive.
-  if (config.enableHttpRoute) {
+  if (initial.enableHttpRoute) {
     ctx.inject(['webServer'], (webCtx) => {
       const webServer: WebServer | undefined = webCtx.get('webServer')
       if (webServer === undefined) return
 
-      // Hand the shared token to the page so the client button can authorize
-      // its restart call. `webserver/index-inject` is emitted by the host on
-      // every index render (and collected for the desktop boot IPC); the
-      // `global` row lands a value on `globalThis` for the browser bundle.
       webCtx.on('webserver/index-inject', (table) => {
         table.push({ kind: 'global', name: '__DSH_RESTART_TOKEN__', value: restartToken })
       })
@@ -295,72 +507,30 @@ export function apply(ctx: Context, config: Config): void {
       // (a re-registered identical route would otherwise throw as duplicate).
       webCtx.effect(() => webServer.register({
         kind: 'exact',
-        path: '/api/restart-harness',
-        handler: (req, res) => {
-          if (req.method !== 'POST') {
-            res.statusCode = 405
-            res.setHeader('Allow', 'POST')
-            res.end('method not allowed')
-            return
-          }
-          if (req.headers['x-restart-token'] !== restartToken) {
-            res.statusCode = 401
-            res.end('unauthorized')
-            return
-          }
-          const result = performRestart(ctx, config, { deferExit: true })
-          res.statusCode = 200
-          res.setHeader('content-type', 'application/json')
-          if (!isDesktopHost()) {
-            // Web: flush the reply and give the client a moment to read it
-            // before tearing anything down — exiting immediately after
-            // `finish` can reset the socket mid-read (the client then sees a
-            // network error instead of the 200). The exit must also hook the
-            // response's `finish`/`close` events, NOT an `res.end` callback:
-            // the composition wraps responses in the npm `compression`
-            // middleware, whose `end(chunk, encoding)` override silently
-            // drops a callback argument. (Desktop skips this: the watchdog
-            // quits the whole app after a delay, and this process dies with
-            // it.)
-            let exitRequested = false
-            const requestExitOnce = () => {
-              if (exitRequested) return
-              exitRequested = true
-              setTimeout(() => requestGracefulExit(ctx), REPLY_DRAIN_DELAY_MS)
-            }
-            res.once('finish', requestExitOnce)
-            res.once('close', requestExitOnce)
-          }
-          res.end(
-            JSON.stringify({
-              ok: true,
-              watchdogSpawned: result.watchdogSpawned,
-              gracefulExitRequested: result.gracefulExitRequested,
-            }),
-            'utf8',
-          )
-        },
+        path: RESTART_ROUTE,
+        handler: createRestartRouteHandler({ ctx, restartToken, snapshot }),
       }), 'one-click-restart: /api/restart-harness route')
-      ctx.logger(name).info('one-click-restart: restart HTTP route ready (POST /api/restart-harness)')
+      ctx.logger(name).info('one-click-restart: restart HTTP route ready (GET token, POST restart on /api/restart-harness)')
     })
   }
 
   ctx.logger(name).info(
     'one-click-restart ready (app=%s, delayMs=%d, http=%s)',
-    config.appName,
-    config.relaunchDelayMs,
-    config.enableHttpRoute,
+    initial.appName,
+    initial.relaunchDelayMs,
+    initial.enableHttpRoute,
   )
 
-  // Expose the restart token to other host plugins that may want to build
-  // their own entry (read-only; no side effects).
-  ctx.provide('restartHarnessToken', { get: () => restartToken })
+  // Expose the token to other host plugins that may want to build their own
+  // entry (read-only; no side effects). The name is namespaced with the
+  // package id so it cannot collide with another plugin's service.
+  ctx.provide('oneClickRestart.token', { get: () => snapshot().restartToken })
 }
 
 /** Read-only token handle other host plugins may inject.
- *  Declared here so `inject: ['restartHarnessToken']` type-checks. */
+ *  Declared here so `inject: ['oneClickRestart.token']` type-checks. */
 declare module '@deepseek-ai/cordis' {
   interface Context {
-    restartHarnessToken?: { get(): string }
+    'oneClickRestart.token'?: { get(): string }
   }
 }
