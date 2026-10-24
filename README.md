@@ -15,7 +15,7 @@ dsh plugin --profile <你的 profile> add github:G57651/dsh-one-click-restart
 **方式二**——下载 [Releases](https://github.com/G57651/dsh-one-click-restart/releases) 里的 `.tgz`：
 
 ```sh
-dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.1.1.tgz
+dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.1.5.tgz
 ```
 
 装完**重启一次 DSH**。之后侧边栏左下角（Settings 上方）会出现「重启 Harness」。
@@ -34,8 +34,8 @@ dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.1.1.
 
 ## 兼容性
 
-- 依赖 `@deepseek-ai/dsh-tools: ^0.1.7-rc.1 || ^0.2.0-rc.1`，支持 DSH 0.1.7-rc.x 与 0.2.0-rc.x。
-- DSH（0.2.0 起）会主动检查插件声明的 `@deepseek-ai/dsh-*` peer：版本不匹配时，**安装会被直接拒绝或回滚**，已装的插件行会被置为 `disabled`（表现为「插件没生效」而不是报错）。
+- 声明 `engines.dsh: ^0.2.0-rc.1 || ^0.2.1-rc.2`，peer 依赖 `@deepseek-ai/dsh-tools: ^0.1.7-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.2`，支持 DSH 0.1.7-rc.x、0.2.0-rc.x 与 0.2.1-rc.x（已在 0.2.1-rc.2 上实测）。
+- DSH（0.2.0 起）会主动检查插件声明的 `@deepseek-ai/dsh-*` peer：版本不匹配时，**安装会被直接拒绝或回滚**，已装的插件行会被置为 `disabled`（表现为「插件没生效」而不是报错）。检查由 app-boot 的 `evaluatePluginCompatibility` 执行，它用 `semver.satisfies(runtime, range, { includePrerelease: true })` 比较——预发布版本参与范围匹配，所以 `^0.2.0-rc.1` 能匹配 0.2.1-rc.2。但同样的范围在**不带** `includePrerelease` 的工具里（如 pnpm 默认的 peer 提示）会被判为不满足，因此两个范围都显式写上了 `^0.2.1-rc.2`。
 - 这是有意为之：客户端 bundle 依赖宿主的模块表与 sidebar slot 契约，这些都随 DSH 版本变化，而宿主**不对客户端产物做任何版本检查**。宁可让不兼容在安装期报错，也不让它在运行时炸。
 - DSH 发布更新的 0.2.x / 0.3.0 时本插件需要再次跟进 peer 范围。届时可用 `dsh plugin --profile <p> allow-version ...` 临时豁免，或等新版本。
 
@@ -117,6 +117,14 @@ pnpm build          # tsc 产出 lib/index.js 与 lib/index.d.ts，esbuild 产�
 [MIT](./LICENSE)
 
 ## 变更记录
+
+### 0.1.5
+
+- **适配 DSH 0.2.1-rc.2**：devDependencies 全部对齐 0.2.1-rc.2（`@deepseek-ai/cordis` 4.0.5、`dsh-client-ui-renderer` / `dsh-client-ui-slots` / `dsh-cmdline` / `dsh-host-webserver` / `dsh-tools` 均升到 0.2.1-rc.2）。
+- **补 `engines.dsh`**：新增 `^0.2.0-rc.1 || ^0.2.1-rc.2`，让宿主在安装前就能判定兼容，而不是仅靠 peer 预检。`@deepseek-ai/dsh-tools` peer 范围同步补上 `^0.2.1-rc.2`——只写 `^0.2.0-rc.1` 时，按 semver 默认语义（不带 `includePrerelease`）判定为**不满足** 0.2.1-rc.2，会让 `pnpm` 等工具报 peer 冲突。
+- **修复 Windows 构建脚本**（真实缺陷，两处）：
+  - `outputFiles` 的键此前用 `file.path.split('/').pop()` 取文件名——esbuild 在 Windows 上返回反斜杠路径，切分后键是整条路径，`outputs['client.js']` 为 `undefined`，Windows 上构建直接崩。改用 `node:path` 的 `basename()`。
+  - `body.padStart(before.length, '\n')` 是**静默无效**的：`padStart` 按总长度补齐，而 bundle body 远长于 6 字符，所以一行都没补，sourcemap 相对 `lib/client.js` 整体偏移 6 行（断点与错误堆栈全部指错位置）。改为 `shiftMap()` 在 map 的 `mappings` 前面补 6 个分号，按行偏移映射；已对照 esbuild 原生 map 验证：行数差正好 6、去掉 6 个前导分号后 `mappings` 与原生逐字符一致。
 
 ### 0.1.4
 
