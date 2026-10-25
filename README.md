@@ -15,7 +15,7 @@ dsh plugin --profile <你的 profile> add github:G57651/dsh-one-click-restart
 **方式二**——下载 [Releases](https://github.com/G57651/dsh-one-click-restart/releases) 里的 `.tgz`：
 
 ```sh
-dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.1.5.tgz
+dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.1.6.tgz
 ```
 
 装完**重启一次 DSH**。之后侧边栏左下角（Settings 上方）会出现「重启 Harness」。
@@ -34,7 +34,7 @@ dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.1.5.
 
 ## 兼容性
 
-- 声明 `engines.dsh: ^0.2.0-rc.1 || ^0.2.1-rc.2`，peer 依赖 `@deepseek-ai/dsh-tools: ^0.1.7-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.2`，支持 DSH 0.1.7-rc.x、0.2.0-rc.x 与 0.2.1-rc.x（已在 0.2.1-rc.2 上实测）。
+- 声明 `engines.dsh: ^0.2.0-rc.1 || ^0.2.1-rc.2 || ^0.2.1-rc.3`，peer 依赖 `@deepseek-ai/dsh-tools: ^0.1.7-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.2 || ^0.2.1-rc.3`，支持 DSH 0.1.7-rc.x、0.2.0-rc.x 与 0.2.1-rc.x（已在 0.2.1-rc.3 上实测）。
 - DSH（0.2.0 起）会主动检查插件声明的 `@deepseek-ai/dsh-*` peer：版本不匹配时，**安装会被直接拒绝或回滚**，已装的插件行会被置为 `disabled`（表现为「插件没生效」而不是报错）。检查由 app-boot 的 `evaluatePluginCompatibility` 执行，它用 `semver.satisfies(runtime, range, { includePrerelease: true })` 比较——预发布版本参与范围匹配，所以 `^0.2.0-rc.1` 能匹配 0.2.1-rc.2。但同样的范围在**不带** `includePrerelease` 的工具里（如 pnpm 默认的 peer 提示）会被判为不满足，因此两个范围都显式写上了 `^0.2.1-rc.2`。
 - 这是有意为之：客户端 bundle 依赖宿主的模块表与 sidebar slot 契约，这些都随 DSH 版本变化，而宿主**不对客户端产物做任何版本检查**。宁可让不兼容在安装期报错，也不让它在运行时炸。
 - DSH 发布更新的 0.2.x / 0.3.0 时本插件需要再次跟进 peer 范围。届时可用 `dsh plugin --profile <p> allow-version ...` 临时豁免，或等新版本。
