@@ -118,6 +118,16 @@ pnpm build          # tsc 产出 lib/index.js 与 lib/index.d.ts，esbuild 产�
 
 ## 变更记录
 
+
+### 0.1.6
+
+适配 DSH 0.2.1-rc.3（插件行为零变化，仅清单声明与依赖对齐）：
+
+- **`engines.dsh` 补上 `^0.2.1-rc.3`**：范围变为 `^0.2.0-rc.1 || ^0.2.1-rc.2 || ^0.2.1-rc.3`。
+- **`@deepseek-ai/dsh-tools` peer 范围同步补上 `^0.2.1-rc.3`**：原范围以 `^0.2.1-rc.2` 结尾，按 semver 默认语义不匹配 rc.3，显式补齐消除歧义。
+- **devDependencies 全部对齐 0.2.1-rc.3**：`dsh-client-ui-renderer` / `dsh-client-ui-slots` / `dsh-cmdline` / `dsh-host-webserver` / `dsh-tools` 从 0.2.1-rc.2 升到 0.2.1-rc.3。
+- **验证**：`tsc -p tsconfig.build.json` 与 `tsc --noEmit` 通过；`scripts/build-client.mjs` 产出客户端 bundle（外壳与 sourcemap 行偏移修复保持不变）；按宿主真实判定逻辑对 0.2.1-rc.3 / rc.2 / 0.2.0-rc.1 三版本判定全 PASS。
+
 ### 0.1.5
 
 - **适配 DSH 0.2.1-rc.2**：devDependencies 全部对齐 0.2.1-rc.2（`@deepseek-ai/cordis` 4.0.5、`dsh-client-ui-renderer` / `dsh-client-ui-slots` / `dsh-cmdline` / `dsh-host-webserver` / `dsh-tools` 均升到 0.2.1-rc.2）。
