@@ -15,7 +15,7 @@ dsh plugin --profile <你的 profile> add github:G57651/dsh-one-click-restart
 **方式二**——下载 [Releases](https://github.com/G57651/dsh-one-click-restart/releases) 里的 `.tgz`：
 
 ```sh
-dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.1.6.tgz
+dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.2.1.tgz
 ```
 
 装完**重启一次 DSH**。之后侧边栏左下角（Settings 上方）会出现「重启 Harness」。
@@ -27,10 +27,14 @@ dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.1.6.
 | 运行面 | 状态 |
 |---|---|
 | **macOS 桌面端** | ✅ 已实测：点击 → 应用整体退出 → 自动重新拉起 |
-| **web / headless**（`dsh web`） | ✅ 已实测：点击 → 进程退出 → watchdog 拉起 |
-| Windows / Linux 桌面端 | ⚠️ **未验证**。代码路径会走 web 那条（`ctx.appExit`），但没有人在这些系统的 Electron 壳上跑过。按钮应当出现，重启行为未经验证 |
+| **Windows 桌面端** | ✅ 已适配：watchdog 的退出/拉起链路在 Windows 11 上以真实 GUI 进程完成自动化验证（优雅 WM_CLOSE 退出、滞留强杀升级、重新拉起、免配置解析）。完整 DSH 桌面链路（按钮 → 重启）欢迎真机反馈 |
+| **web / headless**（`dsh web`） | ✅ 已实测（macOS）；Windows headless 见下方配置说明 |
+| Linux 桌面端 | ⚠️ **未验证**。会走 web 路径（`ctx.appExit`），但自动化拉起仍是 macOS 的 `open -a`，在 Linux 上不可用 |
 
-桌面端的自动化重启依赖 macOS 的 `open` / AppleScript quit 事件，因此**本质上只在 macOS 上做自动化**；其他系统的桌面端会退化为「宿主自己退出 + `open` 拉起」。
+- macOS 桌面端：watchdog 用 AppleScript quit 事件优雅退出整个应用，`open -a` 拉起。
+- **Windows 桌面端**：watchdog 用 `taskkill /IM`（不带 `/F`）向应用窗口发送 WM_CLOSE（等同正常关闭），滞留则按 PID 升级为 `taskkill /F` 强杀，最后经 `cmd /c start` 以与用户双击一致的方式重新拉起应用 exe（窗口正常显示，不会缩进托盘）。零配置可用：桌面宿主有两种形态（utilityProcess / fork 出的 node 子进程，随启动而异），插件都会把当前运行的应用 exe 传给 watchdog。托盘常驻（无窗口）的应用收不到 WM_CLOSE，Windows 宽限默认只有 1 秒即转强杀，点击到进程组替换约 3.4 秒、到窗口恢复约 7.5 秒（含应用自身启动）。
+- Windows **headless**（`dsh web`）没有"当前运行的 exe"可依据，watchdog 依次尝试：`appBundlePath` 配置 → `%LOCALAPPDATA%\Programs\<appName>\` 与 Program Files 下的 `<appName>.exe` → 注册表 `App Paths`。都找不到时立即失败并提示设置 `appBundlePath`。
+- Windows 上 watchdog 与应用是**同一个 exe 镜像**（宿主是 Electron utility process），所有进程枚举都会排除 watchdog 自身，强杀只按 PID 执行、绝不使用 `taskkill /IM /F`。
 
 ## 兼容性
 
@@ -57,8 +61,13 @@ Node/Electron 进程无法自己拉起自己，所以重启动作交给一个**�
 
 两种运行面的退出策略不同：
 
-- **桌面端**（`process.connected`）：宿主**不自行退出**。Electron main 会把「非请求性的宿主死亡」当致命错误弹恢复对话框，而 dispose 完成的宿主又会因父 IPC 挂着事件循环不自然退出。所以由 watchdog 用 AppleScript quit 事件优雅退出**整个应用**、等它真正消失（滞留则升格 SIGTERM/SIGKILL）后 `open -a` 拉起。
+- **桌面端**（`process.connected`）：宿主**不自行退出**。Electron main 会把「非请求性的宿主死亡」当致命错误弹恢复对话框，而 dispose 完成的宿主又会因父 IPC 挂着事件循环不自然退出。所以由 watchdog 优雅退出**整个应用**（macOS：AppleScript quit 事件；Windows：`taskkill /IM` 发送 WM_CLOSE）、等它真正消失（滞留则升格强杀）后重新拉起。
 - **web / headless**：HTTP 响应冲刷完毕后经 `ctx.appExit(0)` 有界退出，另有硬退出兜底。
+
+进程匹配方式（watchdog 用它判断「应用退干净了没」「拉起来没有」）：
+
+- **macOS**：按完整路径模式 `<appName>.app/Contents/MacOS/<appName>`（pgrep -f），发信号前用 `ps` 复核 PID 归属。
+- **Windows**：按镜像名 `<exe 文件名>`（tasklist）。`tasklist`/`taskkill` 输出按 CSV 结构解析，不依赖控制台代码页；每个 PID 强杀前都重新用 `tasklist /FI "PID eq"` 复核镜像名，防 PID 复用误杀。
 
 ## 配置
 
@@ -68,13 +77,17 @@ Node/Electron 进程无法自己拉起自己，所以重启动作交给一个**�
 - id: one-click-restart
   name: "@dsh-restart/one-click-restart"
   config:
-    appName: "DeepSeek Harness"   # open -a 用的应用名
+    appName: "DeepSeek Harness"   # macOS: open -a 用的应用名;Windows: 兜底镜像名 <appName>.exe
     relaunchDelayMs: 1500          # 退出后到拉起之间的延迟
     maxRelaunchAttempts: 10        # 拉起重试次数
     requestGracefulExit: true      # web 路径是否走 appExit
     enableHttpRoute: true          # 是否暴露按钮用的 HTTP 路由
     # restartToken: 固定令牌（默认每次启动随机生成）
-    # appBundlePath: /Applications/DeepSeek Harness.app
+    # appBundlePath:
+    #   macOS:    /Applications/DeepSeek Harness.app
+    #   Windows:  C:\...\DeepSeek Harness.exe（或其安装文件夹）
+    #            Windows 桌面端默认自动使用当前运行的应用 exe,通常无需设置;
+    #            headless(dsh web)拉起失败时按提示设置这一项。
 ```
 
 ## 故障排查
@@ -87,6 +100,9 @@ Node/Electron 进程无法自己拉起自己，所以重启动作交给一个**�
 | **按钮变红「无法连接宿主，重启未开始」** | 取令牌的同源 `GET` 都没成功：宿主进程已不在、端口不通、或路由被禁用（`enableHttpRoute: false`）。确认 DSH 正在运行，或检查 profile 配置。 |
 | **按钮变红「重启失败：forbidden」** | 请求不是从本机 loopback 同源页面发出的（被反代/远程访问改写了 Host，或 `sec-fetch-site: cross-site`）。此路由按设计只服务本机页面。 |
 | **点了只退出、不重新拉起** | 看 `~/Library/Logs/DeepSeek Harness/crash-*.log`。若出现宿主被弹恢复对话框，说明走了非预期路径；macOS 上还需确认 `open -a "DeepSeek Harness"` 能拉起应用（应用名改了需同步 `appName`）。 |
+| **Windows：日志出现 "cannot determine what to relaunch on Windows"** | watchdog 找不到要拉起的 exe（常见于 headless）。在配置里把 `appBundlePath` 设为应用 exe 的完整路径（如 `C:\Program Files\DeepSeek Harness\DeepSeek Harness.exe`），或确认应用装在 `%LOCALAPPDATA%\Programs\<appName>\`、Program Files 或注册表 `App Paths` 能找到的位置。 |
+| **Windows：报 `--app-path` 指向 .lnk 被拒绝** | 快捷方式拿不到真实镜像名，退出阶段无法可靠判断「退干净没」。请直接指向 exe；指向安装文件夹也可以（会解析其中的 `<文件夹名>.exe`）。 |
+| **Windows：管理员权限运行的 DSH 重启失败** | watchdog 继承宿主的令牌；若应用以管理员运行而拉起被 UAC 拦截，请以相同权限层级运行，或检查组策略。 |
 | **点了完全没反应** | 应用可能有活跃任务，Harness 自身的退出确认拦下了。 |
 
 ## 从源码构建
@@ -118,6 +134,34 @@ pnpm build          # tsc 产出 lib/index.js 与 lib/index.d.ts，esbuild 产�
 
 ## 变更记录
 
+
+### 0.2.1
+
+Windows 真机反馈的三项修复:
+
+- **重启提速(~20s → 点击到窗口恢复约 7.5s)**:Windows 上 `taskkill /IM` 的 WM_CLOSE 对托盘常驻应用(无窗口可收)完全无效,原实现仍傻等 15 秒宽限才强杀。现在 Windows 默认宽限 **1 秒**(`--quit-grace-ms`,macOS 仍为 15 秒):WM_CLOSE 要么一秒内生效、要么根本不会生效;desktop 退出模式下触发响应冲刷所需的延迟封顶 200ms(原为完整 `relaunchDelayMs` 1.5s);强杀阶段对全部 PID **并行**复核与终止(原为逐个串行);所有轮询间隔 150ms。退出阶段(点击→进程组替换)实测约 3.4s,其余约 4s 为应用自身启动,插件无法压缩。
+- **重启后不再缩在托盘**:改为经 `cmd /c start` 拉起——与用户双击完全同构的进程形态(正常 STARTUPINFO 显示状态、无 Electron 子进程上下文)。原先的裸 detached spawn 会以异常显示状态创建首窗口,应用"隐形"启动只剩托盘图标。拉起环境剥离 `ELECTRON_*` / `CHROME_*` 继承变量(含指向已死父进程的 crashpad 管道)。
+- **修复宿主形态判定**(真机发现):Windows 桌面宿主有两种形态——Electron utilityProcess 子进程和 fork 出的 node 模式子进程——哪种形态出现**随启动而异**,原实现依赖的 `process.connected` 在 forked 形态下为 false,导致重启什么都不发生(不传 `--app-path`、不退出)。现在:只要 `process.execPath` 不是裸 node.exe 就传 `--app-path`;desktop 判定增加"父进程镜像名 == 应用 exe"检查(`isWindowsAppHosted`,apply 后首次使用时计算一次),两种形态都正确走 quitApp 路径。
+
+### 0.2.0
+
+**Windows 平台适配**（watchdog 与宿主半部；macOS 行为零变化）：
+
+- **`scripts/relaunch.mjs` 全面跨平台化**，按 `process.platform` 分派,macOS 路径（AppleScript quit / pgrep / ps / `open -a`）原样保留,新增 Windows 实现：
+  - **优雅退出**：`taskkill /IM <镜像名>`（不带 `/F`）向应用窗口发送 WM_CLOSE——正常关闭路径,Electron main 走自己的 quit 流程（AppleScript quit 事件的对应物）。无窗口进程（包括 watchdog 自身）会被该命令拒绝而非强杀,因此它伤不到 watchdog。
+  - **强杀升级**：宽限期后逐 PID 复核镜像名（`tasklist /FI "PID eq"`,防 PID 复用误杀）再 `taskkill /F /PID`。**从不用 `taskkill /IM /F` / `/T`**。
+  - **同镜像自排除**（Windows 特有关键点）：Windows 上 Electron 的 utility process 与主进程是同一个 exe,watchdog 由 `process.execPath` 在 `ELECTRON_RUN_AS_NODE` 下拉起——与应用**共享镜像名**。所有 tasklist 枚举都排除 watchdog 自身 PID,否则「应用退干净了」永远不成立、升级阶段会杀死 watchdog 自己。
+  - **重新拉起**：直接 detached spawn 应用 exe（`windowsHide`,`cwd` 设为 exe 目录,剥离 `ELECTRON_RUN_AS_NODE`）。目标解析顺序：`--app-path`（exe 或安装文件夹,拒绝 .lnk）→ `%LOCALAPPDATA%\Programs\<appName>\` 与 Program Files 的 `<appName>.exe` → 注册表 `App Paths`。解析失败立即退出并提示设置 `appBundlePath`,不空耗重试次数。
+  - tasklist/taskkill/reg 输出按 CSV 结构解析,不依赖控制台代码页;新增 `--quit-grace-ms` 参数（默认 15000）。
+  - `--app-name` 校验补充拒绝反斜杠与冒号（Windows 路径注入面）;`--app-path` 新增绝对路径与引号/控制字符校验。
+- **`src/index.ts` 宿主半部**：`spawnWatchdog` 在 Windows 桌面端默认把 `process.execPath`（即应用 exe）作为 `--app-path` 传给 watchdog——桌面端零配置可用;headless 不传（execPath 是 node.exe,拉起它是错的,走上面的解析链）。spawn 增加 `windowsHide: true`,避免 watchdog 闪控制台窗口。工具描述与配置 schema 说明同步。
+- **验证**（Windows 11,以真实进程完成,测试脚本用后即弃）：
+  1. 完整桌面链路:带窗口的测试应用经 WM_CLOSE 优雅退出（以 `FormClosing` 落盘文件证明非强杀）→ 重新拉起为新 PID,watchdog 退出码 0;镜像名含空格的引号处理正确。
+  2. 同镜像自排除:watchdog 与目标同镜像时,tasklist 枚举出 2 个 PID,排除自身后恰为目标。
+  3. 免配置解析:exe 置于 `%LOCALAPPDATA%\Programs\Fake Test App\` 时仅凭 `--app-name` 完成解析与拉起。
+  4. 不可解析目标 98ms 快速失败,提示设置 `appBundlePath`。
+  5. 无窗口应用拒绝 WM_CLOSE → 宽限期后按 PID 强杀 → 拉起成功。
+- `lib/` 产物同步。Linux 不在本次范围（README 平台表已注明其自动化拉起仍不可用）。
 
 ### 0.1.6
 

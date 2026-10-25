@@ -45,9 +45,11 @@ export interface ConfigInput {
  * {@link configValue} / {@link readConfig}.
  */
 export interface Config {
-    /** Name used to identify the app for `open -a`. */
+    /** Name used to identify the app: `open -a` on macOS; on Windows the
+     * fallback exe/image name (`<appName>.exe`) when no app path is set. */
     appName: Volatile<string>;
-    /** Optional absolute path to the .app bundle (fallback when `-a` matches nothing). */
+    /** Optional absolute path: the .app bundle on macOS, the app's .exe (or its
+     * install folder) on Windows. Defaults to the running exe on Windows desktop. */
     appBundlePath: Volatile<string | undefined>;
     /** Milliseconds to wait after exit before relaunching. */
     relaunchDelayMs: Volatile<number>;

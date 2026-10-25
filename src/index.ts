@@ -12,9 +12,9 @@
  *      can trigger the same restart.
  *   3. Spawns a **detached watchdog** (scripts/relaunch.mjs) that survives this
  *      process and handles the relaunch — on desktop it gracefully quits the
- *      whole application first (AppleScript quit event) and relaunches once it
- *      is gone; on web the host exits itself via `ctx.appExit` and the watchdog
- *      relaunches.
+ *      whole application first (macOS: AppleScript quit event; Windows:
+ *      WM_CLOSE via taskkill) and relaunches once it is gone; on web the host
+ *      exits itself via `ctx.appExit` and the watchdog relaunches.
  *   4. If the launcher provided `ctx.appExit` (the bounded exit request from
  *      `@deepseek-ai/dsh-cmdline`), requests a graceful `exit(0)` so the current
  *      instance actually quits before the watchdog relaunches it.
@@ -27,10 +27,10 @@ import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-cmdline'
 import type { WebRoute, WebServer } from '@deepseek-ai/dsh-host-webserver'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 export const name = 'one-click-restart'
 // `tools` is required for the model entry; `webServer` is probed at runtime
@@ -64,9 +64,11 @@ export interface ConfigInput {
  * {@link configValue} / {@link readConfig}.
  */
 export interface Config {
-  /** Name used to identify the app for `open -a`. */
+  /** Name used to identify the app: `open -a` on macOS; on Windows the
+   * fallback exe/image name (`<appName>.exe`) when no app path is set. */
   appName: Volatile<string>
-  /** Optional absolute path to the .app bundle (fallback when `-a` matches nothing). */
+  /** Optional absolute path: the .app bundle on macOS, the app's .exe (or its
+   * install folder) on Windows. Defaults to the running exe on Windows desktop. */
   appBundlePath: Volatile<string | undefined>
   /** Milliseconds to wait after exit before relaunching. */
   relaunchDelayMs: Volatile<number>
@@ -108,10 +110,10 @@ export interface RestartOutcome {
 export const Config: Schema<ConfigInput, Config> = Schema.object({
   appName: Schema.string()
     .default('DeepSeek Harness')
-    .description('App name for `open -a <name>` on macOS.')
+    .description('App name for `open -a <name>` on macOS; on Windows the fallback image name (`<name>.exe`) when no app path is set.')
     .volatile(),
   appBundlePath: Schema.string()
-    .description('Optional absolute path to the .app bundle.')
+    .description('Optional absolute path: the .app bundle on macOS, the app .exe (or its install folder) on Windows.')
     .volatile(),
   relaunchDelayMs: Schema.number()
     .default(1500)
@@ -193,6 +195,44 @@ export function isDesktopHost(): boolean {
 }
 
 /**
+ * Whether this Windows host process runs under the app's own executable
+ * rather than a bare node. Desktop hosts come in two shapes — an Electron
+ * utilityProcess child and a forked node-mode child of the app exe — and
+ * which one serves a given launch differs, so the relaunch target is derived
+ * from execPath instead of from process.connected.
+ */
+function runsUnderAppExe(): boolean {
+  return process.platform === 'win32' && !/^node(\.exe)?$/i.test(basename(process.execPath))
+}
+
+/** Image name of the parent process (Windows), or undefined when it cannot be read. */
+function parentImageName(): string | undefined {
+  const check = spawnSync('tasklist', ['/FI', `PID eq ${process.ppid}`, '/FO', 'CSV', '/NH'], {
+    encoding: 'utf8', windowsHide: true,
+  })
+  return /^"([^"]*)","(\d+)"/.exec(String(check.stdout ?? ''))?.[1]
+}
+
+let windowsAppHostedCache: boolean | undefined
+/**
+ * Whether this Windows host is a child of the app's own executable — true for
+ * every desktop host shape (the parent of both the utilityProcess and the
+ * forked node-mode host is the app's Electron main). Such a host must not
+ * exit itself: Electron treats an unrequested host death as fatal, so the
+ * watchdog owns the quit-and-relaunch. Computed once at first use — the
+ * parent link is only meaningful while the app is alive, and a restart-time
+ * snapshot cannot drift.
+ */
+export function isWindowsAppHosted(): boolean {
+  if (process.platform !== 'win32') return false
+  if (windowsAppHostedCache === undefined) {
+    windowsAppHostedCache = runsUnderAppExe() &&
+      (parentImageName()?.toLowerCase() ?? '') === basename(process.execPath).toLowerCase()
+  }
+  return windowsAppHostedCache
+}
+
+/**
  * Loopback guard for the restart route. The route is registered as an `exact`
  * WebServer route, and exact routes win over the Connection package's `/api`
  * prefix route — so the request never passes through that package's
@@ -228,21 +268,32 @@ export function isTrustedLoopbackRequest(req: { headers: Record<string, string |
  *     not killed when the parent (host) exits.
  *   - `stdio: 'ignore'` severs the pipes so the child never blocks on a closed fd.
  *   - `child.unref()` lets the current event loop exit without waiting for the child.
+ *   - `windowsHide: true` keeps the detached node child from flashing a console
+ *     window on Windows.
  * The watchdog carries the app identity + policy through argv, not env, so no
- * secret/state leaks and it survives independently.
+ * secret/state leaks and it survives independently. On Windows the relaunch
+ * target is the running executable itself whenever this host runs under the
+ * app exe (both desktop host shapes do): `process.execPath` IS the app's .exe
+ * and is passed as the default `--app-path` (the macOS equivalent does not
+ * exist — there `open -a` resolves the app by name).
  */
 function spawnWatchdog(config: ResolvedConfig, options?: { quitApp?: boolean }): void {
+  // Windows only: execPath is the app exe unless we run under a bare node
+  // (the headless case, where relaunching node would be wrong).
+  const defaultWindowsAppPath = runsUnderAppExe() ? process.execPath : undefined
+  const appPath = config.appBundlePath ?? defaultWindowsAppPath
   const argv = [
     WATCHDOG_SCRIPT,
     '--app-name', config.appName,
     '--delay', String(config.relaunchDelayMs),
     '--attempts', String(config.maxRelaunchAttempts),
-    ...(config.appBundlePath ? ['--app-path', config.appBundlePath] : []),
+    ...(appPath ? ['--app-path', appPath] : []),
     ...(options?.quitApp === true ? ['--quit-app'] : []),
   ]
   const child = spawn(process.execPath, argv, {
     detached: true,
     stdio: 'ignore',
+    windowsHide: true,
     // On desktop process.execPath is the Electron binary; without this the
     // "node" script would boot a second GUI app instead of the watchdog.
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
@@ -274,11 +325,12 @@ export function requestGracefulExit(ctx: Context): boolean {
  * graceful exit when the launcher provided one. Safe to call from the tool or
  * the HTTP route.
  *
- * Desktop (`process.connected`): no host-side exit at all — the watchdog
- * gracefully quits the whole application (a clean quit Apple Event) and
- * relaunches it once it is gone; this process dies with the app. Exiting the
- * host alone would either hang on its parent IPC or surface Electron's fatal
- * recovery dialog.
+ * Desktop (`process.connected`, or on Windows any host running under the app
+ * exe — see {@link isWindowsAppHosted}): no host-side exit at all — the
+ * watchdog gracefully quits the whole application (a clean quit Apple Event /
+ * WM_CLOSE) and relaunches it once it is gone; this process dies with the app.
+ * Exiting the host alone would either hang on its parent IPC or surface
+ * Electron's fatal recovery dialog.
  *
  * Web/headless: the single harness process exits itself via `ctx.appExit`.
  * Pass `deferExit: true` to skip the exit request — the HTTP handler flushes
@@ -298,7 +350,7 @@ export function performRestart(
   const delayMs =
     overrides?.delayMs !== undefined ? overrides.delayMs : config.relaunchDelayMs
   const policy: ResolvedConfig = { ...config, relaunchDelayMs: Math.max(0, delayMs) }
-  const desktop = isDesktopHost()
+  const desktop = isDesktopHost() || isWindowsAppHosted()
 
   // 1. Spawn the detached watchdog first — it must survive our own exit.
   spawnWatchdog(policy, { quitApp: desktop })
@@ -334,8 +386,9 @@ function createRestartTool({ ctx, snapshot }: {
     description:
       'Restart the DeepSeek Harness application. Spawns a detached watchdog that ' +
       'relaunches the app after the current instance exits, then requests a graceful ' +
-      'exit of the current process. On macOS this relaunches via `open -a`; the watchdog ' +
-      'retries until the app is back up or a configured attempt limit is reached.',
+      'exit of the current process. On macOS the app relaunches via `open -a`; on ' +
+      'Windows the running executable is spawned again. The watchdog retries until ' +
+      'the app is back up or a configured attempt limit is reached.',
     parameters: {
       delayMs: {
         type: 'number',

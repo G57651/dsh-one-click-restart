@@ -1,6 +1,6 @@
 {
   "name": "@dsh-restart/one-click-restart",
-  "version": "0.1.6",
+  "version": "0.2.1",
   "description": "One-click restart for DeepSeek Harness: a model-callable tool plus a detached watchdog that relaunches the app after exit.",
   "type": "module",
   "main": "lib/index.js",
