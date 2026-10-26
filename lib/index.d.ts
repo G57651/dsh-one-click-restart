@@ -93,6 +93,7 @@ export declare const Config: Schema<ConfigInput, Config>;
  * parent IPC), so the watchdog owns the quit-and-relaunch.
  */
 export declare function isDesktopHost(): boolean;
+export declare function isWindowsAppHosted(): boolean;
 /**
  * Whether this Windows host is a child of the app's own executable — true for
  * every desktop host shape (the parent of both the utilityProcess and the

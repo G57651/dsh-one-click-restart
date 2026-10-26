@@ -15,7 +15,7 @@ dsh plugin --profile <你的 profile> add github:G57651/dsh-one-click-restart
 **方式二**——下载 [Releases](https://github.com/G57651/dsh-one-click-restart/releases) 里的 `.tgz`：
 
 ```sh
-dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.3.0.tgz
+dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.3.1.tgz
 ```
 
 装完**重启一次 DSH**。之后侧边栏左下角（Settings 上方）会出现「重启 Harness」。
@@ -58,6 +58,7 @@ Node/Electron 进程无法自己拉起自己，所以重启动作交给一个**�
 - `detached: true` → 子进程自成一个会话，父进程退出不会连带杀死它；
 - `stdio: 'ignore'` + `child.unref()` → 不持有父进程的管道与事件循环；
 - watchdog 本身只做三件事，**不依赖任何 Harness 服务**。
+- 并发触发受跨进程单飞锁保护，进行中的重启不会被打断。
 
 两种运行面的退出策略不同：
 
@@ -80,6 +81,7 @@ Node/Electron 进程无法自己拉起自己，所以重启动作交给一个**�
     appName: "DeepSeek Harness"   # macOS: 应用名/进程匹配前缀;Windows: 兜底镜像名 <appName>.exe
     relaunchDelayMs: 1500          # 退出后到拉起之间的延迟
     maxRelaunchAttempts: 10        # 拉起重试次数
+    # quitGraceMs 由 watchdog --quit-grace-ms 控制,最小 500;触发进行中的重复重启会被单飞锁忽略
     requestGracefulExit: true      # web 路径是否走 appExit
     enableHttpRoute: true          # 是否暴露按钮用的 HTTP 路由
     # restartToken: 固定令牌（默认每次启动随机生成）
@@ -136,6 +138,17 @@ pnpm build          # tsc 产出 lib/index.js 与 lib/index.d.ts，esbuild 产�
 
 ## 变更记录
 
+
+### 0.3.1
+
+代码审查修复轮(由 GLM 5.3 Flash 按任务书执行、独立门禁验收、人工二次审查):
+
+- **watchdog 跨进程单飞锁**:并发触发的重复重启不再互相干扰——锁文件(`%TEMP%\dsh-one-click-restart.watchdog.lock`,内容为持有者 PID)保证同一时刻只有一个 watchdog 执行退出/拉起;持有者存活时后来者立即避让(实测 87ms 退出),持有者死亡时陈旧锁被接管,所有退出路径均释放锁。修复"重启进行中再点一次会把刚拉起的实例再杀一遍"的竞态。
+- **路由退出判定统一**:HTTP 路由的延迟退出分支改用与 `performRestart` 相同的 `exitOwnedByWatchdog()`(= `isDesktopHost() || isWindowsAppHosted()`),forked 宿主形态下不再误走 web 自退出路径与 watchdog 竞争。
+- **补齐类型声明**:`lib/index.d.ts` 补 `isWindowsAppHosted`(运行时已导出而类型缺失)。
+- **参数处理**:`--delay 0` 合法(原被静默改为 1500);`--quit-grace-ms` 低于 500 时显式告警后再取默认值。
+- **解析加固**:`winAppPids` 把 tasklist 非零退出且无结构化输出视为"未知"而非"无进程"(防误判应用已退出);注册表 `App Paths` 值改按 `REG_SZ` 列头定位(路径值含 `_SZ` 时不再截断);`--app-path` 拒绝 `%` 与 `!`(会被 `cmd /c start` 展开)。
+- **README**:补单飞锁与 `quitGraceMs` 说明。
 
 ### 0.3.0
 

@@ -48,9 +48,14 @@
  * terminated.
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { basename, dirname, isAbsolute, join } from 'node:path'
+
+/** Cross-process single-flight lock: a second watchdog started while one is
+ *  mid-restart must not quit the instance the first one just relaunched. */
+const LOCK_FILE = join(tmpdir(), 'dsh-one-click-restart.watchdog.lock')
 
 const IS_WIN = process.platform === 'win32'
 
@@ -109,7 +114,7 @@ function validateAppPath(value) {
   if (!isAbsolute(value)) return false
   // Quotes and control characters could break the command lines this value
   // ends up in (tasklist/taskkill filters, CreateProcess).
-  if (/["\u0000-\u001f\u007f]/.test(value)) return false
+  if (/["%!\u0000-\u001f\u007f]/.test(value)) return false
   return true
 }
 
@@ -136,8 +141,36 @@ function parseArgs(argv) {
     console.error(`[one-click-restart] refusing unsafe --app-path ${JSON.stringify(out.appPath)}; ignoring it`)
     out.appPath = ''
   }
-  if (!Number.isFinite(out.quitGraceMs) || out.quitGraceMs < 500) out.quitGraceMs = QUIT_GRACE_MS
+  if (!Number.isFinite(out.quitGraceMs) || out.quitGraceMs < 500) {
+    console.error(`[one-click-restart] --quit-grace-ms must be >= 500; using default ${QUIT_GRACE_MS}`)
+    out.quitGraceMs = QUIT_GRACE_MS
+  }
   return out
+}
+
+/** Acquire the single-flight lock. Returns true when this watchdog may run.
+ *  A stale lock (holder gone) is taken over; a live holder means another
+ *  watchdog is mid-restart — exit quietly and let it finish. */
+function acquireLock() {
+  try {
+    if (existsSync(LOCK_FILE)) {
+      const pid = Number(readFileSync(LOCK_FILE, 'utf8').trim())
+      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
+        let alive = false
+        try { process.kill(pid, 0); alive = true } catch { alive = false }
+        if (alive) {
+          console.error(`[one-click-restart] another watchdog (pid ${pid}) is mid-restart; standing down`)
+          return false
+        }
+      }
+    }
+    writeFileSync(LOCK_FILE, String(process.pid), { flag: 'w' })
+    return true
+  } catch (error) {
+    // A lock we cannot read or write must not block a restart.
+    console.error(`[one-click-restart] lock check failed (${error.message}); proceeding`)
+    return true
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +360,16 @@ function winImageName(exePath, appName) {
   return appName.toLowerCase().endsWith('.exe') ? appName : `${appName}.exe`
 }
 
+/** PIDs parsed out of tasklist CSV rows (`"image.exe","1234",...`). */
+function parsePids(output) {
+  const pids = []
+  for (const line of String(output ?? '').split(/\r?\n/)) {
+    const row = /^"[^"]*","(\d+)"/.exec(line)
+    if (row) pids.push(Number(row[1]))
+  }
+  return pids
+}
+
 /**
  * PIDs of every process running the app's image, excluding the watchdog's
  * own PID, or null when tasklist failed outright. tasklist prints CSV rows
@@ -336,12 +379,12 @@ function winImageName(exePath, appName) {
 function winAppPids(image) {
   const check = spawnSync('tasklist', ['/FI', `IMAGENAME eq ${image}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8' })
   if (check.error) return null
-  const pids = []
-  for (const line of String(check.stdout ?? '').split(/\r?\n/)) {
-    const row = /^"[^"]*","(\d+)"/.exec(line)
-    if (row) pids.push(Number(row[1]))
+  if (check.status !== 0) {
+    // tasklist exits non-zero on real failures; an empty output then means
+    // "unknown", not "no processes" — a wrong [] would read as "app gone".
+    return /^"[^"]*","(\d+)"/m.test(String(check.stdout ?? '')) ? parsePids(check.stdout) : null
   }
-  return pids.filter((pid) => pid !== process.pid)
+  return parsePids(check.stdout).filter((pid) => pid !== process.pid)
 }
 
 /** Whether any process of the app (other than the watchdog itself) is alive. */
@@ -477,7 +520,7 @@ function winResolveExe(target) {
       .split(/\r?\n/)
       .find((l) => l.includes('_SZ'))
     if (line === undefined) continue
-    const value = line.slice(line.lastIndexOf('_SZ') + 3).trim().replace(/^"|"$/g, '')
+    const value = line.slice(line.indexOf('REG_SZ') + 'REG_SZ'.length).trim().replace(/^"|"$/g, '')
     if (value && existsSync(value)) return { exe: value }
   }
   return null
@@ -554,8 +597,10 @@ async function waitForLaunch(target, timeoutMs = 5000) {
 }
 
 async function main() {
+  // Single-flight: acquireLock() stands down when another watchdog is mid-restart.
+  if (!acquireLock()) process.exit(0)
   const target = parseArgs(process.argv)
-  const delay = Number.isFinite(target.delay) && target.delay > 0 ? target.delay : 1500
+  const delay = Number.isFinite(target.delay) && target.delay >= 0 ? target.delay : 1500
   const attempts = Number.isFinite(target.attempts) && target.attempts > 0 ? target.attempts : 10
 
   if (IS_WIN) {
@@ -567,6 +612,7 @@ async function main() {
         `[one-click-restart] cannot determine what to relaunch on Windows; set appBundlePath ` +
         `to the full path of "${winImageName(null, target.appName)}" (or its install folder) in the plugin config`,
       )
+      try { unlinkSync(LOCK_FILE) } catch {}
       process.exit(1)
     }
     target.win = { exe: resolved.exe, image: winImageName(resolved.exe, target.appName) }
@@ -625,6 +671,7 @@ async function main() {
     const appeared = await waitForLaunch(target)
     if (code === 0 && appeared) {
       console.log(`[one-click-restart] relaunched "${target.appName}" (attempt ${attempt})`)
+      try { unlinkSync(LOCK_FILE) } catch {}
       process.exit(0)
     }
     console.error(
@@ -634,6 +681,7 @@ async function main() {
   }
 
   console.error(`[one-click-restart] could not relaunch "${target.appName}" after ${attempts} attempts`)
+  try { unlinkSync(LOCK_FILE) } catch {}
   process.exit(1)
 }
 

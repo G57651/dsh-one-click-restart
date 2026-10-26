@@ -243,6 +243,12 @@ export function isWindowsAppHosted(): boolean {
   return windowsAppHostedCache
 }
 
+/** Whether the watchdog owns the whole-app quit (desktop shapes): the host
+ *  must not request its own exit in this case. */
+function exitOwnedByWatchdog() {
+  return isDesktopHost() || isWindowsAppHosted()
+}
+
 /**
  * Loopback guard for the restart route. The route is registered as an `exact`
  * WebServer route, and exact routes win over the Connection package's `/api`
@@ -367,7 +373,7 @@ export function performRestart(
   const delayMs =
     overrides?.delayMs !== undefined ? overrides.delayMs : config.relaunchDelayMs
   const policy: ResolvedConfig = { ...config, relaunchDelayMs: Math.max(0, delayMs) }
-  const desktop = isDesktopHost() || isWindowsAppHosted()
+  const desktop = exitOwnedByWatchdog()
 
   // 1. Spawn the detached watchdog first — it must survive our own exit.
   spawnWatchdog(policy, { quitApp: desktop })
@@ -504,7 +510,7 @@ function createRestartRouteHandler({ ctx, restartToken, snapshot }: {
     const result = performRestart(ctx, snapshot(), { deferExit: true })
     res.statusCode = 200
     res.setHeader('content-type', 'application/json')
-    if (!isDesktopHost()) {
+    if (!exitOwnedByWatchdog()) {
       // Web: flush the reply and give the client a moment to read it
       // before tearing anything down — exiting immediately after
       // `finish` can reset the socket mid-read (the client then sees a
