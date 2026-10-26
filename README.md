@@ -15,7 +15,7 @@ dsh plugin --profile <你的 profile> add github:G57651/dsh-one-click-restart
 **方式二**——下载 [Releases](https://github.com/G57651/dsh-one-click-restart/releases) 里的 `.tgz`：
 
 ```sh
-dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.3.1.tgz
+dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.3.2.tgz
 ```
 
 装完**重启一次 DSH**。之后侧边栏左下角（Settings 上方）会出现「重启 Harness」。
@@ -138,6 +138,12 @@ pnpm build          # tsc 产出 lib/index.js 与 lib/index.d.ts，esbuild 产�
 
 ## 变更记录
 
+
+### 0.3.2
+
+真机回归发现的并发修复:
+
+- **宿主侧重启冷却期(10 秒)**:watchdog 的单飞锁只拦"并发"的 watchdog——若第二次触发来得晚、其 watchdog 在第一次重启**完成之后**才完成启动,它会拿到已释放的锁,把刚拉起的应用再重启一遍(真机双触发实测复现)。现在同一宿主进程 10 秒内的重复触发直接忽略,返回 `watchdogSpawned: false` 与说明。
 
 ### 0.3.1
 

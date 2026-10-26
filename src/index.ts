@@ -151,6 +151,13 @@ const HARD_EXIT_FALLBACK_MS = 6000
 /** Grace period after the reply finishes before the exit is requested. */
 const REPLY_DRAIN_DELAY_MS = 400
 
+/** Cooldown between two restarts triggered from the same host process. The
+ *  watchdog's single-flight lock only stops CONCURRENT watchdogs — a second
+ *  trigger whose watchdog boots after the first one finished would acquire
+ *  the freed lock and restart the freshly relaunched app again. */
+const RESTART_COOLDOWN_MS = 10000
+let lastRestartAt = 0
+
 /**
  * Read one config field, tolerating both shapes: schemastery wraps every
  * `.volatile()` field in a stable `{ get() }` reference, so the live value is
@@ -370,6 +377,18 @@ export function performRestart(
   config: ResolvedConfig,
   overrides?: { delayMs?: number; deferExit?: boolean },
 ): RestartOutcome {
+  const now = Date.now()
+  if (now - lastRestartAt < RESTART_COOLDOWN_MS) {
+    return {
+      watchdogSpawned: false,
+      gracefulExitRequested: false,
+      detail:
+        `A restart was triggered ${Math.round((now - lastRestartAt) / 1000)}s ago and is still in progress; ` +
+        'ignoring this trigger (cooldown).',
+    }
+  }
+  lastRestartAt = now
+
   const delayMs =
     overrides?.delayMs !== undefined ? overrides.delayMs : config.relaunchDelayMs
   const policy: ResolvedConfig = { ...config, relaunchDelayMs: Math.max(0, delayMs) }
