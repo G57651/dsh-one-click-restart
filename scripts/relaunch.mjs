@@ -65,6 +65,24 @@ const QUIT_GRACE_MS = IS_WIN ? 1000 : 15000
 /** Grace period after the force-kill pass before giving up on it. */
 const KILL_GRACE_MS = 5000
 const POLL_INTERVAL_MS = 150
+/**
+ * macOS liveness tick. Each `pgrep` spawn costs ~23ms, so the old
+ * spawn-per-tick loop both paid that cost and capped detection latency at
+ * 150ms. The macOS poller captures PIDs once and probes them with
+ * `process.kill(pid, 0)` (~0.5µs), which makes a 40ms tick cheaper than the
+ * old one and several times finer.
+ */
+const MAC_LIVENESS_POLL_MS = 40
+/**
+ * Settle between "app confirmed gone" and `open -n` on macOS. The former
+ * 1000ms wait existed only to let LaunchServices unregister the app (a plain
+ * `open -a` against a stale registration merely "activates" the corpse).
+ * `open -n` launches unconditionally, so this only covers the quit path's
+ * last teardown flush.
+ */
+const MAC_RELAUNCH_SETTLE_MS = 250
+/** Tick for the post-launch verification poll (was 200ms). */
+const LAUNCH_POLL_MS = 100
 
 /**
  * App names are interpolated into a pgrep/pkill `-f` pattern and into an
@@ -148,6 +166,49 @@ function macAppRunning(appName) {
 }
 
 /**
+ * Whether a PID still exists. Signal 0 only probes: EPERM means the process is
+ * alive but owned by another user (alive as far as we are concerned), ESRCH
+ * means it is gone. Costs ~0.5µs — no subprocess, which is what makes the 40ms
+ * tick cheaper than a single `pgrep` spawn.
+ */
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error.code === 'EPERM'
+  }
+}
+
+/**
+ * Wait for every process of the app to disappear, polling a captured PID set
+ * in-process (see {@link pidAlive}) and re-scanning with `pgrep` only when that
+ * set drains — which is also what catches a straggler the initial scan missed
+ * (or one spawned while quitting, e.g. a helper). Returns true when a full
+ * `pgrep` sweep comes back empty, false when `deadline` passes first.
+ *
+ * PID reuse cannot produce a false "alive": a reused PID only extends the wait,
+ * and the sweep still decides when the set drains.
+ */
+async function macWaitForExit(appName, deadline) {
+  let pids = macAppPids(appName) ?? []
+  while (Date.now() < deadline) {
+    const alive = pids.filter(pidAlive)
+    if (alive.length === 0) {
+      // Every known PID is gone; a fresh sweep either confirms the exit or
+      // hands us the stragglers to watch next.
+      const stragglers = macAppPids(appName) ?? []
+      if (stragglers.length === 0) return true
+      pids = stragglers
+      continue
+    }
+    pids = alive
+    await sleep(MAC_LIVENESS_POLL_MS)
+  }
+  return false
+}
+
+/**
  * Whether a PID's current command line still matches the app pattern. PIDs are
  * recycled, so a PID taken from pgrep a moment ago may already belong to an
  * unrelated process by the time the signal is sent; `ps` re-reads the live
@@ -195,22 +256,42 @@ function macKillRemaining(appName) {
   return !macAppRunning(appName)
 }
 
-/** Ask the app to quit through its quit Apple Event (a normal, clean quit). */
+/**
+ * Send the quit Apple Event (a normal, clean quit) and return the child without
+ * awaiting it.
+ *
+ * The reply to `tell application X to quit` arrives only after the app has
+ * finished tearing down (measured ~560ms here), so awaiting it before polling
+ * spends that whole window doing nothing. Delivery is observable as the app
+ * disappearing; the reply only reports whether the helper errored, which is
+ * logged when it lands. {@link waitForExit}'s quit-grace escalation remains the
+ * authority if the event never lands.
+ */
 function macQuitApp(appName) {
   const script = `tell application ${JSON.stringify(appName)} to quit`
-  return new Promise((resolve) => {
-    const child = spawn('/usr/bin/osascript', ['-e', script], { stdio: 'ignore' })
+  const child = spawn('/usr/bin/osascript', ['-e', script], { stdio: 'ignore' })
+  const done = new Promise((resolve) => {
     child.on('error', (error) => {
       console.error(`[one-click-restart] quit failed: ${error.message}`)
       resolve(false)
     })
     child.on('close', (code) => resolve(code === 0))
   })
+  return { child, done }
 }
 
-/** Launch the app via `open`, returning the command's exit code. */
-function macRelaunch(target) {
+/**
+ * Launch the app via `open`, returning the command's exit code.
+ *
+ * `forceNew` adds `-n`: LaunchServices then starts a fresh instance instead of
+ * trying to activate the app it still believes is running — the exact race the
+ * old fixed 1000ms post-quit wait worked around (the process can be dead while
+ * its registration lingers). Only pass it after the app is confirmed gone; with
+ * a live instance it would start a second copy.
+ */
+function macRelaunch(target, options) {
   const args = target.appPath ? [target.appPath] : ['-a', target.appName]
+  if (options?.forceNew === true) args.unshift('-n')
   // `open` propagates the calling environment into the launched app. This
   // watchdog itself may run under ELECTRON_RUN_AS_NODE=1 (the host spawns it
   // with the Electron binary as node) — inherited, that variable makes the
@@ -448,9 +529,15 @@ function appRunning(target) {
 /** Wait until the app (and its lingering host child) is fully gone. */
 async function waitForExit(target) {
   const termDeadline = Date.now() + target.quitGraceMs
-  while (Date.now() < termDeadline) {
-    if (!appRunning(target)) return true
-    await sleep(POLL_INTERVAL_MS)
+  // macOS polls a captured PID set in-process (see macWaitForExit): cheaper and
+  // finer than the generic spawn-per-tick loop, and it does its own pgrep sweep.
+  if (!IS_WIN) {
+    if (await macWaitForExit(target.appName, termDeadline)) return true
+  } else {
+    while (Date.now() < termDeadline) {
+      if (!appRunning(target)) return true
+      await sleep(POLL_INTERVAL_MS)
+    }
   }
   console.error(`[one-click-restart] app still running after quit grace period; escalating`)
   return IS_WIN ? winKillRemaining(target.win.image) : macKillRemaining(target.appName)
@@ -461,7 +548,7 @@ async function waitForLaunch(target, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (appRunning(target)) return true
-    await sleep(200)
+    await sleep(LAUNCH_POLL_MS)
   }
   return false
 }
@@ -496,26 +583,45 @@ async function main() {
     // Desktop mode: the app is still running and must be quit first. The
     // host's own reply already reached the page, so a short, quiet quit is
     // safe here.
-    const quitOk = IS_WIN ? await winQuitApp(target.win.image) : await macQuitApp(target.appName)
-    const gone = await waitForExit(target)
-    if (!gone) {
-      console.error(`[one-click-restart] could not quit "${target.appName}"; relaunching anyway`)
-    } else if (!quitOk) {
-      console.error(`[one-click-restart] quit request errored, but the app is gone`)
-    }
-    if (!IS_WIN) {
-      // The process can be dead while LaunchServices still lists the app as
-      // running; an immediate `open -a` then merely "activates" the corpse
-      // and returns 0 without launching anything. Let it unregister first.
-      await sleep(1000)
+    //
+    // macOS sends the quit Apple Event and starts polling immediately: the
+    // event's reply only arrives after the app has finished tearing down
+    // (~560ms), so awaiting it first would serialise that window with the
+    // exit wait instead of overlapping them. Windows keeps the old shape —
+    // `taskkill /IM` returns as soon as WM_CLOSE is posted.
+    if (IS_WIN) {
+      const quitOk = await winQuitApp(target.win.image)
+      const gone = await waitForExit(target)
+      if (!gone) {
+        console.error(`[one-click-restart] could not quit "${target.appName}"; relaunching anyway`)
+      } else if (!quitOk) {
+        console.error(`[one-click-restart] quit request errored, but the app is gone`)
+      }
+    } else {
+      const quit = macQuitApp(target.appName)
+      const gone = await waitForExit(target)
+      const quitOk = await quit.done
+      if (!gone) {
+        console.error(`[one-click-restart] could not quit "${target.appName}"; relaunching anyway`)
+      } else if (!quitOk) {
+        console.error(`[one-click-restart] quit request errored, but the app is gone`)
+      }
+      // `open -n` starts a new instance unconditionally, so LaunchServices
+      // still listing the just-quit app can no longer turn the relaunch into a
+      // no-op. The settle only covers the quit path's final teardown flush.
+      await sleep(MAC_RELAUNCH_SETTLE_MS)
     }
   }
 
+  // `forceNew` on macOS is only valid once the app is confirmed gone: with a
+  // live instance `open -n` would start a second copy. The desktop quit path
+  // has just verified that; the web path never had an app to reuse.
+  const relaunchOptions = IS_WIN ? undefined : { forceNew: target.quitApp }
+
   for (let attempt = 1; attempt <= attempts; attempt++) {
-    const code = IS_WIN ? await winRelaunch(target) : await macRelaunch(target)
-    // A zero exit code is not proof anything launched (macOS has the
-    // activation race above; Windows spawn errors surface asynchronously) —
-    // verify the process actually appeared.
+    const code = IS_WIN ? await winRelaunch(target) : await macRelaunch(target, relaunchOptions)
+    // A zero exit code is not proof anything launched (Windows spawn errors
+    // surface asynchronously) — verify the process actually appeared.
     const appeared = await waitForLaunch(target)
     if (code === 0 && appeared) {
       console.log(`[one-click-restart] relaunched "${target.appName}" (attempt ${attempt})`)

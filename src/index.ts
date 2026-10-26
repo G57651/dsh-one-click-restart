@@ -185,6 +185,17 @@ function readConfig(config: Config): ResolvedConfig {
 }
 
 /**
+ * The `.app` bundle containing an executable, or undefined when the path is not
+ * inside one. A macOS bundle keeps its binary at `<bundle>.app/Contents/MacOS/
+ * <exe>`, so the bundle root is three levels up — slicing at the *last*
+ * `.app` segment also handles bundles nested in other `.app`-named paths.
+ */
+function enclosingAppBundle(execPath: string): string | undefined {
+  const match = /^(.+\.app)\/Contents\/MacOS\/[^/]+$/.exec(execPath)
+  return match?.[1]
+}
+
+/**
  * True when this host process is a supervised child of the Electron app.
  * On desktop the restart must quit the whole application (main.js treats an
  * unrequested host death as fatal, and a disposed host process lingers on its
@@ -274,14 +285,20 @@ export function isTrustedLoopbackRequest(req: { headers: Record<string, string |
  * secret/state leaks and it survives independently. On Windows the relaunch
  * target is the running executable itself whenever this host runs under the
  * app exe (both desktop host shapes do): `process.execPath` IS the app's .exe
- * and is passed as the default `--app-path` (the macOS equivalent does not
- * exist — there `open -a` resolves the app by name).
+ * and is passed as the default `--app-path`. On macOS the equivalent is the
+ * enclosing `.app` bundle, derived from the same execPath: passing the bundle
+ * path lets `open` skip the LaunchServices name lookup of `open -a <name>`, and
+ * pins the relaunch to the bundle that actually ran.
  */
 function spawnWatchdog(config: ResolvedConfig, options?: { quitApp?: boolean }): void {
   // Windows only: execPath is the app exe unless we run under a bare node
   // (the headless case, where relaunching node would be wrong).
   const defaultWindowsAppPath = runsUnderAppExe() ? process.execPath : undefined
-  const appPath = config.appBundlePath ?? defaultWindowsAppPath
+  // macOS only, desktop host: execPath is <bundle>.app/Contents/MacOS/<exe>.
+  const defaultMacAppPath = process.platform === 'darwin' && isDesktopHost()
+    ? enclosingAppBundle(process.execPath)
+    : undefined
+  const appPath = config.appBundlePath ?? defaultWindowsAppPath ?? defaultMacAppPath
   const argv = [
     WATCHDOG_SCRIPT,
     '--app-name', config.appName,

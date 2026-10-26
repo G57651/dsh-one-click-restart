@@ -15,7 +15,7 @@ dsh plugin --profile <你的 profile> add github:G57651/dsh-one-click-restart
 **方式二**——下载 [Releases](https://github.com/G57651/dsh-one-click-restart/releases) 里的 `.tgz`：
 
 ```sh
-dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.2.1.tgz
+dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.3.0.tgz
 ```
 
 装完**重启一次 DSH**。之后侧边栏左下角（Settings 上方）会出现「重启 Harness」。
@@ -31,7 +31,7 @@ dsh plugin --profile <你的 profile> add ./dsh-restart-one-click-restart-0.2.1.
 | **web / headless**（`dsh web`） | ✅ 已实测（macOS）；Windows headless 见下方配置说明 |
 | Linux 桌面端 | ⚠️ **未验证**。会走 web 路径（`ctx.appExit`），但自动化拉起仍是 macOS 的 `open -a`，在 Linux 上不可用 |
 
-- macOS 桌面端：watchdog 用 AppleScript quit 事件优雅退出整个应用，`open -a` 拉起。
+- macOS 桌面端：watchdog 用 AppleScript quit 事件优雅退出整个应用，随后以 `open -n`（强制新实例）按 bundle 路径拉起——不再依赖应用名解析，也不怕 LaunchServices 还挂着刚退出的旧注册。退出等待改用 PID 存活轮询（40ms 粒度、进程内 `kill(pid,0)`），quit 事件发出后不再等它的回执而是并行开始轮询，原先「退出后固定等 1 秒」的死时间已取消。watchdog 自身耗时实测中位数 **1754ms → 851ms**（Calculator.app，5/5 成功）。
 - **Windows 桌面端**：watchdog 用 `taskkill /IM`（不带 `/F`）向应用窗口发送 WM_CLOSE（等同正常关闭），滞留则按 PID 升级为 `taskkill /F` 强杀，最后经 `cmd /c start` 以与用户双击一致的方式重新拉起应用 exe（窗口正常显示，不会缩进托盘）。零配置可用：桌面宿主有两种形态（utilityProcess / fork 出的 node 子进程，随启动而异），插件都会把当前运行的应用 exe 传给 watchdog。托盘常驻（无窗口）的应用收不到 WM_CLOSE，Windows 宽限默认只有 1 秒即转强杀，点击到进程组替换约 3.4 秒、到窗口恢复约 7.5 秒（含应用自身启动）。
 - Windows **headless**（`dsh web`）没有"当前运行的 exe"可依据，watchdog 依次尝试：`appBundlePath` 配置 → `%LOCALAPPDATA%\Programs\<appName>\` 与 Program Files 下的 `<appName>.exe` → 注册表 `App Paths`。都找不到时立即失败并提示设置 `appBundlePath`。
 - Windows 上 watchdog 与应用是**同一个 exe 镜像**（宿主是 Electron utility process），所有进程枚举都会排除 watchdog 自身，强杀只按 PID 执行、绝不使用 `taskkill /IM /F`。
@@ -77,7 +77,7 @@ Node/Electron 进程无法自己拉起自己，所以重启动作交给一个**�
 - id: one-click-restart
   name: "@dsh-restart/one-click-restart"
   config:
-    appName: "DeepSeek Harness"   # macOS: open -a 用的应用名;Windows: 兜底镜像名 <appName>.exe
+    appName: "DeepSeek Harness"   # macOS: 应用名/进程匹配前缀;Windows: 兜底镜像名 <appName>.exe
     relaunchDelayMs: 1500          # 退出后到拉起之间的延迟
     maxRelaunchAttempts: 10        # 拉起重试次数
     requestGracefulExit: true      # web 路径是否走 appExit
@@ -85,6 +85,8 @@ Node/Electron 进程无法自己拉起自己，所以重启动作交给一个**�
     # restartToken: 固定令牌（默认每次启动随机生成）
     # appBundlePath:
     #   macOS:    /Applications/DeepSeek Harness.app
+    #             macOS 桌面端默认由宿主 execPath 自动推导(.app 包路径),通常无需设置;
+    #             headless(dsh web)无法推导时按提示设置这一项。
     #   Windows:  C:\...\DeepSeek Harness.exe（或其安装文件夹）
     #            Windows 桌面端默认自动使用当前运行的应用 exe,通常无需设置;
     #            headless(dsh web)拉起失败时按提示设置这一项。
@@ -134,6 +136,20 @@ pnpm build          # tsc 产出 lib/index.js 与 lib/index.d.ts，esbuild 产�
 
 ## 变更记录
 
+
+### 0.3.0
+
+**macOS 重启提速：watchdog 自身耗时中位数 1754ms → 851ms（Calculator.app 实测，5/5 成功；同样 6/6 通过 bundle 路径模式）**
+
+取消的三处等待，全部来自「无法更快确认状态」而非真实工作需要：
+
+- **quit 事件不再串行等待回执**：`tell application X to quit` 的 AppleScript 回执要等应用**拆完**才返回（实测约 560ms），旧实现 `await` 它之后才开始轮询退出,等于把这段时间和退出等待串起来。现在发出事件后立刻并行轮询，回执只用于失败告警；`quitGraceMs` 到期强杀的兜底语义不变。
+- **退出检测改为进程内 PID 存活轮询**：旧实现每 150ms `spawn` 一次 `pgrep`（每次约 23ms 进程开销）。现在先用 `pgrep` 抓一次 PID 集合，之后用 `process.kill(pid, 0)`（约 0.5µs，ESRCH=已死 / EPERM=仍活）以 **40ms** 粒度轮询；集合清空时再做一次 `pgrep` 全扫，扫到即认领新 PID（退出过程中新生的 helper 也能被抓住）。PID 复用不会制造假活——只会多等一轮，最终仍由全扫裁决。
+- **取消退出后固定 1 秒等待**：这段等待原本只为躲 LaunchServices「进程已死但注册还在」的竞态（此时 `open -a` 只会激活尸体、返回 0 却不拉起）。改用 `open -n` 强制新实例后该竞态不再成立，只剩 250ms 收尾沉降；`open -n` 仅在确认应用已消失后使用（否则会开出第二份实例）。
+- **拉起目标改为 bundle 路径**：桌面宿主从自身 `execPath`（`<bundle>.app/Contents/MacOS/<exe>`）推导 `.app` 路径并作为 `--app-path` 传给 watchdog，`open` 因此跳过按应用名的 LaunchServices 查找；`appBundlePath` 配置仍优先。web/headless 路径不变（不传 `-n`，应用从未运行过）。
+- **拉起验证轮询 200ms → 100ms**。
+
+Windows 代码路径零改动（9 个 `win*` 函数逐字节比对一致）；`quitGraceMs`/`maxRelaunchAttempts`/argv 契约/日志格式均未变。
 
 ### 0.2.1
 

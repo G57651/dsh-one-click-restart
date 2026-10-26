@@ -12,9 +12,9 @@
  *      can trigger the same restart.
  *   3. Spawns a **detached watchdog** (scripts/relaunch.mjs) that survives this
  *      process and handles the relaunch — on desktop it gracefully quits the
- *      whole application first (AppleScript quit event) and relaunches once it
- *      is gone; on web the host exits itself via `ctx.appExit` and the watchdog
- *      relaunches.
+ *      whole application first (macOS: AppleScript quit event; Windows:
+ *      WM_CLOSE via taskkill) and relaunches once it is gone; on web the host
+ *      exits itself via `ctx.appExit` and the watchdog relaunches.
  *   4. If the launcher provided `ctx.appExit` (the bounded exit request from
  *      `@deepseek-ai/dsh-cmdline`), requests a graceful `exit(0)` so the current
  *      instance actually quits before the watchdog relaunches it.
@@ -94,6 +94,16 @@ export declare const Config: Schema<ConfigInput, Config>;
  */
 export declare function isDesktopHost(): boolean;
 /**
+ * Whether this Windows host is a child of the app's own executable — true for
+ * every desktop host shape (the parent of both the utilityProcess and the
+ * forked node-mode host is the app's Electron main). Such a host must not
+ * exit itself: Electron treats an unrequested host death as fatal, so the
+ * watchdog owns the quit-and-relaunch. Computed once at first use — the
+ * parent link is only meaningful while the app is alive, and a restart-time
+ * snapshot cannot drift.
+ */
+export declare function isWindowsAppHosted(): boolean;
+/**
  * Loopback guard for the restart route. The route is registered as an `exact`
  * WebServer route, and exact routes win over the Connection package's `/api`
  * prefix route — so the request never passes through that package's
@@ -121,11 +131,12 @@ export declare function requestGracefulExit(ctx: Context): boolean;
  * graceful exit when the launcher provided one. Safe to call from the tool or
  * the HTTP route.
  *
- * Desktop (`process.connected`): no host-side exit at all — the watchdog
- * gracefully quits the whole application (a clean quit Apple Event) and
- * relaunches it once it is gone; this process dies with the app. Exiting the
- * host alone would either hang on its parent IPC or surface Electron's fatal
- * recovery dialog.
+ * Desktop (`process.connected`, or on Windows any host running under the app
+ * exe — see {@link isWindowsAppHosted}): no host-side exit at all — the
+ * watchdog gracefully quits the whole application (a clean quit Apple Event /
+ * WM_CLOSE) and relaunches it once it is gone; this process dies with the app.
+ * Exiting the host alone would either hang on its parent IPC or surface
+ * Electron's fatal recovery dialog.
  *
  * Web/headless: the single harness process exits itself via `ctx.appExit`.
  * Pass `deferExit: true` to skip the exit request — the HTTP handler flushes
